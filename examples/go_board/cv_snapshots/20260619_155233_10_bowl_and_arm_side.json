@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "created_at": 1781877153.826464,
+  "label": "10 bowl and arm side",
+  "image": "20260619_155233_10_bowl_and_arm_side.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      629.0,
+      56.0
+    ],
+    [
+      1447.0,
+      52.0
+    ],
+    [
+      1474.0,
+      816.0
+    ],
+    [
+      638.0,
+      844.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "overlay_fisheye_k": -0.14,
+  "stones": [
+    {
+      "coord": "B2",
+      "row": 1,
+      "col": 1,
+      "color": "white"
+    },
+    {
+      "coord": "S2",
+      "row": 1,
+      "col": 17,
+      "color": "black"
+    },
+    {
+      "coord": "C3",
+      "row": 2,
+      "col": 2,
+      "color": "black"
+    },
+    {
+      "coord": "D17",
+      "row": 16,
+      "col": 3,
+      "color": "black"
+    },
+    {
+      "coord": "E18",
+      "row": 17,
+      "col": 4,
+      "color": "white"
+    },
+    {
+      "coord": "S18",
+      "row": 17,
+      "col": 17,
+      "color": "white"
+    }
+  ],
+  "occupied": {
+    "B2": "white",
+    "S2": "black",
+    "C3": "black",
+    "D17": "black",
+    "E18": "white",
+    "S18": "white"
+  },
+  "summary": {
+    "black": 3,
+    "white": 3,
+    "total": 6
+  }
+}

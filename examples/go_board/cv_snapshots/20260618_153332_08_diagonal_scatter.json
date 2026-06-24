@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "created_at": 1781789612.0905879,
+  "label": "08 diagonal scatter",
+  "image": "20260618_153332_08_diagonal_scatter.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      749.0,
+      51.0
+    ],
+    [
+      1516.0,
+      68.0
+    ],
+    [
+      1527.0,
+      794.0
+    ],
+    [
+      733.0,
+      794.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "stones": [
+    {
+      "coord": "C3",
+      "row": 2,
+      "col": 2,
+      "color": "black"
+    },
+    {
+      "coord": "F6",
+      "row": 5,
+      "col": 5,
+      "color": "white"
+    },
+    {
+      "coord": "K10",
+      "row": 9,
+      "col": 9,
+      "color": "black"
+    },
+    {
+      "coord": "Q16",
+      "row": 15,
+      "col": 15,
+      "color": "white"
+    }
+  ],
+  "occupied": {
+    "C3": "black",
+    "F6": "white",
+    "K10": "black",
+    "Q16": "white"
+  },
+  "summary": {
+    "black": 2,
+    "white": 2,
+    "total": 4
+  },
+  "overlay_fisheye_k": -0.14
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "created_at": 1781787049.7117639,
+  "label": "02 single black center",
+  "image": "20260618_145049_02_single_black_center.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      749.0,
+      51.0
+    ],
+    [
+      1516.0,
+      68.0
+    ],
+    [
+      1527.0,
+      794.0
+    ],
+    [
+      733.0,
+      794.0
+    ]
+  ],
+  "stones": [
+    {
+      "coord": "K10",
+      "row": 9,
+      "col": 9,
+      "color": "black"
+    }
+  ],
+  "occupied": {
+    "K10": "black"
+  },
+  "summary": {
+    "black": 1,
+    "white": 0,
+    "total": 1
+  },
+  "overlay_fisheye_k": -0.14
+}

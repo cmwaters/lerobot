@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "created_at": 1781789217.312638,
+  "label": "05 edge probes",
+  "image": "20260618_152657_05_edge_probes.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      749.0,
+      51.0
+    ],
+    [
+      1516.0,
+      68.0
+    ],
+    [
+      1527.0,
+      794.0
+    ],
+    [
+      733.0,
+      794.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "stones": [
+    {
+      "coord": "K1",
+      "row": 0,
+      "col": 9,
+      "color": "black"
+    },
+    {
+      "coord": "A10",
+      "row": 9,
+      "col": 0,
+      "color": "white"
+    },
+    {
+      "coord": "T10",
+      "row": 9,
+      "col": 18,
+      "color": "black"
+    },
+    {
+      "coord": "K19",
+      "row": 18,
+      "col": 9,
+      "color": "white"
+    }
+  ],
+  "occupied": {
+    "K1": "black",
+    "A10": "white",
+    "T10": "black",
+    "K19": "white"
+  },
+  "summary": {
+    "black": 2,
+    "white": 2,
+    "total": 4
+  },
+  "overlay_fisheye_k": -0.14
+}

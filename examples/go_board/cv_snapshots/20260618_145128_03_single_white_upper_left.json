@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "created_at": 1781787088.16573,
+  "label": "03 single white upper left",
+  "image": "20260618_145128_03_single_white_upper_left.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      749.0,
+      51.0
+    ],
+    [
+      1516.0,
+      68.0
+    ],
+    [
+      1527.0,
+      794.0
+    ],
+    [
+      733.0,
+      794.0
+    ]
+  ],
+  "stones": [
+    {
+      "coord": "D4",
+      "row": 3,
+      "col": 3,
+      "color": "white"
+    }
+  ],
+  "occupied": {
+    "D4": "white"
+  },
+  "summary": {
+    "black": 0,
+    "white": 1,
+    "total": 1
+  },
+  "overlay_fisheye_k": -0.14
+}

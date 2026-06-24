@@ -29,6 +29,7 @@ class SOFollowerConfig:
     port: str
 
     disable_torque_on_disconnect: bool = True
+    configure_on_connect: bool = True
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a dictionary that maps motor

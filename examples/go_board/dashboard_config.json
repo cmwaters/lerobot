@@ -1,0 +1,93 @@
+{
+  "host": "0.0.0.0",
+  "port": 8766,
+  "cameras": [
+    {
+      "name": "overhead",
+      "index_or_path": "/dev/v4l/by-id/usb-HD_Web_Camera_HD_Web_Camera_Ucamera001-video-index0",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "warmup_s": 5,
+      "fourcc": "MJPG"
+    },
+    {
+      "name": "wrist",
+      "index_or_path": "/dev/v4l/by-id/usb-Innomaker_Innomaker-U20CAM-1080p-S1_SN0001-video-index0",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "warmup_s": 5,
+      "fourcc": "MJPG"
+    }
+  ],
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61036031-if00",
+    "id": "so101_follower",
+    "calibrate": false,
+    "configure_on_connect": false,
+    "urdf_path": null,
+    "target_frame_name": "gripper_frame_link",
+    "rest_position": {
+      "shoulder_pan": -100.04,
+      "shoulder_lift": -107.6,
+      "elbow_flex": 95.78,
+      "wrist_flex": 91.87,
+      "wrist_roll": -4.62,
+      "gripper": 0.58
+    }
+  },
+  "leader": {
+    "type": "so101_leader",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6055931-if00",
+    "id": "so101_leader",
+    "calibrate": false
+  },
+  "board": {
+    "camera": "overhead",
+    "size": 19,
+    "corners_tl_tr_br_bl": [
+      [
+        533.0,
+        272.0
+      ],
+      [
+        1381.0,
+        265.0
+      ],
+      [
+        1369.0,
+        1039.0
+      ],
+      [
+        563.0,
+        1046.0
+      ]
+    ],
+    "camera_to_robot_rotation_degrees": 270,
+    "board_pixels": 1000,
+    "sample_radius_ratio": 0.34,
+    "black_l_threshold": 80.0,
+    "white_l_threshold": 165.0,
+    "white_s_threshold": 75.0,
+    "overlay_fisheye_k": -0.14,
+    "stone_min_radius_ratio": 0.24,
+    "stone_max_radius_ratio": 0.48,
+    "stone_min_circularity": 0.45,
+    "stone_max_snap_distance_ratio": 0.52
+  },
+  "model": {
+    "policy_path": "outputs/train/act_go_board_v2/checkpoints/030000/pretrained_model",
+    "remote_host": "",
+    "remote_workdir": "~/Developer/lerobot",
+    "remote_policy_server": "",
+    "policy_type": "act",
+    "actions_per_chunk": 20,
+    "policy_image_size": 224,
+    "device": "cuda",
+    "fps": 10,
+    "duration_s": 10,
+    "release_local_devices": true
+  }
+}

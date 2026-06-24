@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "created_at": 1781848236.300338,
+  "label": "mix_13",
+  "image": "20260619_075036_mix_13.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      629.0,
+      56.0
+    ],
+    [
+      1447.0,
+      52.0
+    ],
+    [
+      1474.0,
+      816.0
+    ],
+    [
+      638.0,
+      844.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "overlay_fisheye_k": -0.14,
+  "stones": [
+    {
+      "coord": "D7",
+      "row": 6,
+      "col": 3,
+      "color": "black"
+    },
+    {
+      "coord": "H7",
+      "row": 6,
+      "col": 7,
+      "color": "black"
+    },
+    {
+      "coord": "C8",
+      "row": 7,
+      "col": 2,
+      "color": "white"
+    },
+    {
+      "coord": "E8",
+      "row": 7,
+      "col": 4,
+      "color": "black"
+    },
+    {
+      "coord": "G8",
+      "row": 7,
+      "col": 6,
+      "color": "white"
+    },
+    {
+      "coord": "L8",
+      "row": 7,
+      "col": 10,
+      "color": "black"
+    },
+    {
+      "coord": "G9",
+      "row": 8,
+      "col": 6,
+      "color": "white"
+    },
+    {
+      "coord": "H9",
+      "row": 8,
+      "col": 7,
+      "color": "black"
+    },
+    {
+      "coord": "K9",
+      "row": 8,
+      "col": 9,
+      "color": "white"
+    },
+    {
+      "coord": "N9",
+      "row": 8,
+      "col": 12,
+      "color": "white"
+    },
+    {
+      "coord": "F10",
+      "row": 9,
+      "col": 5,
+      "color": "white"
+    },
+    {
+      "coord": "K10",
+      "row": 9,
+      "col": 9,
+      "color": "black"
+    },
+    {
+      "coord": "H11",
+      "row": 10,
+      "col": 7,
+      "color": "black"
+    },
+    {
+      "coord": "K11",
+      "row": 10,
+      "col": 9,
+      "color": "white"
+    },
+    {
+      "coord": "L11",
+      "row": 10,
+      "col": 10,
+      "color": "black"
+    },
+    {
+      "coord": "M11",
+      "row": 10,
+      "col": 11,
+      "color": "white"
+    }
+  ],
+  "occupied": {
+    "D7": "black",
+    "H7": "black",
+    "C8": "white",
+    "E8": "black",
+    "G8": "white",
+    "L8": "black",
+    "G9": "white",
+    "H9": "black",
+    "K9": "white",
+    "N9": "white",
+    "F10": "white",
+    "K10": "black",
+    "H11": "black",
+    "K11": "white",
+    "L11": "black",
+    "M11": "white"
+  },
+  "summary": {
+    "black": 8,
+    "white": 8,
+    "total": 16
+  }
+}
