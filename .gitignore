@@ -165,6 +165,16 @@ wandb/
 # Data folders
 data/
 outputs/
+examples/go_board/recordings/
+examples/go_board/rejected_recordings/
+examples/go_board/model_rollouts/
+examples/go_board/runtime/
+examples/go_board/cv_snapshots/debug/
+examples/go_board/cv_snapshots/debug_steps/
+examples/go_board/cv_snapshots/expected_vs_detected/
+examples/go_board/cv_snapshots/simple_hough/
+examples/go_board/cv_snapshots/simple_hough_strict/
+examples/go_board/cv_snapshots/tuning/
 
 # Translations
 *.mo
@@ -176,3 +186,9 @@ outputs/
 *.urdf
 *.xml
 *.part
+!examples/go_board/assets/robotstudio_so101/
+!examples/go_board/assets/robotstudio_so101/assets/
+!examples/go_board/assets/robotstudio_so101/*.urdf
+!examples/go_board/assets/robotstudio_so101/*.xml
+!examples/go_board/assets/robotstudio_so101/assets/*.stl
+!examples/go_board/assets/robotstudio_so101/assets/*.part

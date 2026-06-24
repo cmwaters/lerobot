@@ -101,7 +101,8 @@ class SOFollower(Robot):
         for cam in self.cameras.values():
             cam.connect()
 
-        self.configure()
+        if self.config.configure_on_connect:
+            self.configure()
         logger.info(f"{self} connected.")
 
     @property

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "created_at": 1781801096.4238982,
+  "label": "09 mixed midgame",
+  "image": "20260618_184456_09_mixed_midgame.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      629.0,
+      56.0
+    ],
+    [
+      1447.0,
+      52.0
+    ],
+    [
+      1474.0,
+      816.0
+    ],
+    [
+      638.0,
+      844.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "stones": [
+    {
+      "coord": "D4",
+      "row": 3,
+      "col": 3,
+      "color": "black"
+    },
+    {
+      "coord": "Q4",
+      "row": 3,
+      "col": 15,
+      "color": "white"
+    },
+    {
+      "coord": "K5",
+      "row": 4,
+      "col": 9,
+      "color": "black"
+    },
+    {
+      "coord": "H9",
+      "row": 8,
+      "col": 7,
+      "color": "white"
+    },
+    {
+      "coord": "K10",
+      "row": 9,
+      "col": 9,
+      "color": "white"
+    },
+    {
+      "coord": "N10",
+      "row": 9,
+      "col": 12,
+      "color": "black"
+    },
+    {
+      "coord": "C16",
+      "row": 15,
+      "col": 2,
+      "color": "white"
+    },
+    {
+      "coord": "Q16",
+      "row": 15,
+      "col": 15,
+      "color": "black"
+    }
+  ],
+  "occupied": {
+    "D4": "black",
+    "Q4": "white",
+    "K5": "black",
+    "H9": "white",
+    "K10": "white",
+    "N10": "black",
+    "C16": "white",
+    "Q16": "black"
+  },
+  "summary": {
+    "black": 4,
+    "white": 4,
+    "total": 8
+  },
+  "overlay_fisheye_k": -0.14
+}

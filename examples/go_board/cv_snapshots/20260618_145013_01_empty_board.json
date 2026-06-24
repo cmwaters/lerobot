@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "created_at": 1781787013.2821062,
+  "label": "01 empty board",
+  "image": "20260618_145013_01_empty_board.jpg",
+  "camera": "overhead",
+  "board_size": 19,
+  "corners_tl_tr_br_bl": [
+    [
+      749.0,
+      51.0
+    ],
+    [
+      1516.0,
+      68.0
+    ],
+    [
+      1527.0,
+      794.0
+    ],
+    [
+      733.0,
+      794.0
+    ]
+  ],
+  "camera_to_robot_rotation_degrees": 270,
+  "stones": [],
+  "occupied": {},
+  "summary": {
+    "black": 0,
+    "white": 0,
+    "total": 0
+  },
+  "overlay_fisheye_k": -0.14
+}
