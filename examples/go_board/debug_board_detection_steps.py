@@ -249,6 +249,8 @@ def main() -> None:
         to_image=to_image,
         min_radius_ratio=tuning["stone_min_radius_ratio"],
         max_radius_ratio=tuning["stone_max_radius_ratio"],
+        min_circularity=tuning["stone_min_circularity"],
+        black_grid_min_edge_score=tuning.get("black_grid_min_edge_score", 0.18),
         grid_points=detector_grid_points,
     )
     intersection_overlay = draw_stones(warped_grid, intersection_stones, to_board, "12 accepted intersection-local candidates", (255, 120, 0))

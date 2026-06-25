@@ -66,6 +66,39 @@ uv run python examples/go_board/recording_dashboard.py
 The config stores the camera indices, follower port, and leader port so the
 normal dashboard startup stays a one-command flow.
 
+### Laptop/desktop profiles
+
+Use the profile manager when switching between the laptop recording rig and the
+desktop model-running setup:
+
+```bash
+# Laptop: local cameras + SO-101 leader/follower for teleoperation recording.
+uv run python examples/go_board/manage_dashboard.py laptop
+
+# If macOS renames the arm ports after reconnecting:
+uv run python examples/go_board/manage_dashboard.py laptop \
+  --follower-port /dev/tty.usbmodemFOLLOWER \
+  --leader-port /dev/tty.usbmodemLEADER
+
+# Desktop: start the dashboard on the desktop over Tailscale/SSH.
+uv run python examples/go_board/manage_dashboard.py desktop
+
+# Copy profile files to the desktop after editing them locally.
+uv run python examples/go_board/manage_dashboard.py sync-desktop-configs
+
+# Status/stop helpers.
+uv run python examples/go_board/manage_dashboard.py status-laptop
+uv run python examples/go_board/manage_dashboard.py stop-laptop
+uv run python examples/go_board/manage_dashboard.py status-desktop
+uv run python examples/go_board/manage_dashboard.py stop-desktop
+```
+
+Profile files:
+
+- `dashboard_config.laptop.json`: macOS camera indices and USB modem ports for recording.
+- `dashboard_config.desktop.json`: Linux `/dev/v4l/by-id` and `/dev/serial/by-id` paths for the desktop.
+- `dashboard_config.json`: convenience default, currently matching the laptop profile.
+
 The main dashboard includes an alignment panel. `Set Rest from Leader` snapshots
 the current leader joint angles into `robot.rest_position` in
 `dashboard_config.json`; `Move Follower to Rest` sends the follower to that saved
@@ -279,7 +312,92 @@ uv run --with mujoco python examples/go_board/mujoco_board_sim.py \
   --arm-demo
 ```
 
-This sandbox intentionally starts below the robot layer. The next useful steps
-are adding a simple gripper, then a scripted pick-carry-release teacher that can
-export phase labels such as `stone_held`, `stone_on_board`, and
-`target_error_mm`.
+### Synthetic Nudge Data
+
+`generate_mujoco_nudge_data.py` creates short MuJoCo nudge-only correction
+episodes. A target stone starts near an intended coordinate, optional neighboring
+stones are placed around it, and a candidate-search teacher chooses board-local
+push deltas that reduce target error while penalizing neighbor disturbance.
+
+Generate a small starter set:
+
+```bash
+uv run python examples/go_board/generate_mujoco_nudge_data.py \
+  --episodes 20 \
+  --output-dir outputs/go_board_mujoco_nudge_recordings \
+  --force
+```
+
+Generate the same nudge task with RobotStudio's SO-101 arm meshes in the scene
+and SO-101-shaped joint state/action telemetry:
+
+```bash
+uv run --with mujoco python examples/go_board/generate_mujoco_nudge_data.py \
+  --robot-arm \
+  --episodes 20 \
+  --output-dir outputs/go_board_mujoco_nudge_robot_recordings \
+  --force
+```
+
+Open one seeded robot-arm nudge scenario in MuJoCo's interactive viewer:
+
+```bash
+uv run --with mujoco python examples/go_board/generate_mujoco_nudge_data.py \
+  --robot-arm \
+  --viewer \
+  --viewer-episode-index 0 \
+  --target K10
+```
+
+Convert the robot-arm synthetic recordings with the normal LeRobot converter:
+
+```bash
+uv run --extra dataset python examples/go_board/convert_recordings_to_lerobot.py \
+  --recordings-dir outputs/go_board_mujoco_nudge_robot_recordings \
+  --dataset-root outputs/datasets/go_board_mujoco_nudge_robot_v1 \
+  --repo-id callum/go_board_mujoco_nudge_robot_v1 \
+  --force \
+  --no-done-env-state
+```
+
+Render a watchable side-by-side MP4 preview:
+
+```bash
+uv run python examples/go_board/visualize_mujoco_nudge_data.py \
+  --input-dir outputs/go_board_mujoco_nudge_recordings \
+  --output outputs/go_board_mujoco_nudge_preview.mp4 \
+  --max-episodes 8 \
+  --fps 5
+```
+
+The output is intentionally under `outputs/`, which is git-ignored. Each episode
+folder contains:
+
+- `metadata.json`
+- `telemetry.jsonl`
+- `frames/overhead/*.jpg`
+- `frames/wrist/*.jpg`
+
+The synthetic telemetry stores board-local state under
+`telemetry.synthetic`, including `stone_xy_m`, `stone_offset_xy_m`,
+`neighbor_xy_m`, `target_error_m`, `done`, and the chosen push action:
+
+```json
+{
+  "push_dx_m": 0.004,
+  "push_dy_m": -0.002,
+  "push_distance_m": 0.007
+}
+```
+
+This first generator uses MuJoCo for scene rendering and neighbor context, but
+the teacher is still an oracle-style board-local nudge controller. With
+`--robot-arm`, the scene includes RobotStudio's SO-101 MuJoCo model and STL
+meshes, the wrist camera is attached to the RobotStudio gripper body, and
+`telemetry.joints` / `telemetry.leader_joints` are populated with simulated
+SO-101 joint values. The current wrist camera pose is a simulation mount that
+must be tuned against the physical camera mount before using the renders as
+serious sim-to-real data. The current version moves the stone according to the
+teacher while making the arm follow matching joint-space targets; the next
+fidelity step is replacing that oracle stone motion with contact-only gripper
+motion.

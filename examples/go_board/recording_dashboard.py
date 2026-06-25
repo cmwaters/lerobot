@@ -46,6 +46,7 @@ from process_overhead_recording import overhead_processed_status, process_record
 
 DEFAULT_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 MODEL_ROLLOUTS_DIR_NAME = "model_rollouts"
+DEFAULT_SYNTHETIC_RECORDING_DIR = Path("outputs/go_board_mujoco_nudge_robot_recordings")
 
 
 @dataclass
@@ -95,6 +96,7 @@ class BoardSpec:
     stone_max_radius_ratio: float = 0.48
     stone_min_circularity: float = 0.45
     stone_max_snap_distance_ratio: float = 0.52
+    black_grid_min_edge_score: float = 0.18
 
 
 @dataclass
@@ -294,6 +296,7 @@ def load_dashboard_config(path: Path) -> DashboardConfig:
             stone_max_radius_ratio=float(board_raw.get("stone_max_radius_ratio", 0.48)),
             stone_min_circularity=float(board_raw.get("stone_min_circularity", 0.45)),
             stone_max_snap_distance_ratio=float(board_raw.get("stone_max_snap_distance_ratio", 0.52)),
+            black_grid_min_edge_score=float(board_raw.get("black_grid_min_edge_score", 0.18)),
         ),
         model=ModelSpec(
             policy_path=str(model_raw.get("policy_path", "")),
@@ -908,6 +911,7 @@ class DashboardApp:
         config_path: Path | None = None,
         recording_dir: Path | None = None,
         model_rollout_dir: Path | None = None,
+        synthetic_recording_dir: Path | None = None,
     ):
         self.cameras = {camera.spec.name: camera for camera in cameras}
         self.telemetry = telemetry
@@ -918,6 +922,7 @@ class DashboardApp:
         self.model_rollout_dir = (
             model_rollout_dir if model_rollout_dir is not None else annotation_dir.parent / MODEL_ROLLOUTS_DIR_NAME
         )
+        self.synthetic_recording_dir = synthetic_recording_dir or DEFAULT_SYNTHETIC_RECORDING_DIR
         self.config_path = config_path
         self.board_lock = threading.Lock()
         self.recording_lock = threading.Lock()
@@ -1239,6 +1244,7 @@ class DashboardApp:
             "--timing-warn-threshold=0.05",
             f"--gripper-deadband={run.gripper_deadband}",
             f"--gripper-max-step={run.gripper_max_step}",
+            "--done-stable-frames=5",
         ]
         if run.remote_policy_server:
             rollout_args.extend(
@@ -1360,6 +1366,7 @@ class DashboardApp:
                 "final": None if final is None else board_state_to_jsonable(final),
                 "delta": delta,
                 "target": target,
+                "task_state": None if delta is None else self._task_state_from_delta(delta, target),
             },
             "teleop_started": False,
             "rest_result": rest_result,
@@ -1658,6 +1665,24 @@ class DashboardApp:
             "model_rollouts": items,
         }
 
+    def list_synthetic_recordings(self) -> dict[str, Any]:
+        items = []
+        if self.synthetic_recording_dir.is_dir():
+            for metadata_path in sorted(self.synthetic_recording_dir.glob("*/metadata.json")):
+                try:
+                    item = self._recording_summary_from_metadata(metadata_path)
+                    item["kind"] = "synthetic_recording"
+                    item["source"] = "synthetic"
+                    item["readonly"] = True
+                    items.append(item)
+                except Exception:
+                    continue
+        return {
+            "ok": True,
+            "directory": str(self.synthetic_recording_dir),
+            "synthetic_recordings": items,
+        }
+
     def delete_model_rollout(self, rollout_id: str) -> dict[str, Any]:
         with self.model_lock:
             if self.active_model_run is not None:
@@ -1725,6 +1750,8 @@ class DashboardApp:
         metadata["id"] = recording_path.name
         metadata["name"] = recording_path.name
         metadata["overhead_processed"] = overhead_processed_status(recording_path)
+        self._ensure_task_state(metadata)
+        metadata["task_trace"] = self._load_task_trace(recording_path)
         return {"ok": True, "recording": metadata}
 
     def get_model_rollout(self, rollout_id: str) -> dict[str, Any]:
@@ -1736,7 +1763,26 @@ class DashboardApp:
         metadata["id"] = rollout_path.name
         metadata["name"] = rollout_path.name
         metadata["overhead_processed"] = overhead_processed_status(rollout_path)
+        self._ensure_task_state(metadata)
+        metadata["task_trace"] = self._load_task_trace(rollout_path)
         return {"ok": True, "model_rollout": metadata}
+
+    def get_synthetic_recording(self, recording_id: str) -> dict[str, Any]:
+        recording_path = self._synthetic_recording_path_by_name(recording_id)
+        metadata_path = recording_path / "metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(recording_id)
+        metadata = json.loads(metadata_path.read_text())
+        metadata["id"] = recording_path.name
+        metadata["name"] = recording_path.name
+        metadata["kind"] = "synthetic_recording"
+        metadata["source"] = "synthetic"
+        metadata["readonly"] = True
+        metadata["cameras"] = self._recording_cameras(metadata, recording_path)
+        metadata["overhead_processed"] = overhead_processed_status(recording_path)
+        self._ensure_task_state(metadata)
+        metadata["task_trace"] = self._load_task_trace(recording_path)
+        return {"ok": True, "synthetic_recording": metadata}
 
     def recording_frame_jpeg(self, recording_id: str, camera: str, frame: int) -> bytes:
         recording_path = self._recording_path_by_name(recording_id)
@@ -1758,6 +1804,18 @@ class DashboardApp:
         if camera_name == self.board.camera and processed_path.is_file():
             return processed_path.read_bytes()
         frame_path = rollout_path / "frames" / camera_name / frame_name
+        if not frame_path.is_file():
+            raise FileNotFoundError(str(frame_path))
+        return frame_path.read_bytes()
+
+    def synthetic_recording_frame_jpeg(self, recording_id: str, camera: str, frame: int) -> bytes:
+        recording_path = self._synthetic_recording_path_by_name(recording_id)
+        camera_name = Path(camera).name
+        frame_name = f"{max(0, int(frame)):06d}.jpg"
+        processed_path = recording_path / "overhead_processed" / frame_name
+        if camera_name == self.board.camera and processed_path.is_file():
+            return processed_path.read_bytes()
+        frame_path = recording_path / "frames" / camera_name / frame_name
         if not frame_path.is_file():
             raise FileNotFoundError(str(frame_path))
         return frame_path.read_bytes()
@@ -1846,6 +1904,7 @@ class DashboardApp:
                 "baseline": board_state_to_jsonable(session.baseline),
                 "final": None if final is None else board_state_to_jsonable(final),
                 "delta": delta,
+                "task_state": None if delta is None else self._task_state_from_delta(delta),
             },
             "teleop_started": session.teleop_started,
             "rest_result": rest_result,
@@ -1869,6 +1928,16 @@ class DashboardApp:
         data = json.loads(metadata_path.read_text())
         board = data.get("board", {})
         delta = board.get("delta") or {}
+        task_state = board.get("task_state") or self._task_state_from_delta(delta, board.get("target"))
+        move_name = data.get("move_name")
+        if not move_name:
+            target = board.get("target") or {}
+            target_color = target.get("color")
+            target_coord = target.get("coord")
+            if target_color and target_coord:
+                move_name = f"{target_color}_to_{str(target_coord).lower()}"
+            else:
+                move_name = "recording"
         return {
             "id": metadata_path.parent.name,
             "name": data.get("name", metadata_path.parent.name),
@@ -1876,11 +1945,38 @@ class DashboardApp:
             "started_at": data.get("started_at"),
             "ended_at": data.get("ended_at"),
             "samples": data.get("samples", 0),
-            "move_name": data.get("move_name", "recording"),
+            "move_name": move_name,
             "delta": delta,
-            "cameras": data.get("cameras", {}),
+            "task_state": task_state,
+            "cameras": self._recording_cameras(data, metadata_path.parent),
             "overhead_processed": overhead_processed_status(metadata_path.parent),
+            "run_type": data.get("run_type"),
+            "synthetic": data.get("synthetic"),
         }
+
+    def _recording_cameras(self, metadata: dict[str, Any], recording_path: Path) -> dict[str, Any]:
+        cameras = metadata.get("cameras")
+        if isinstance(cameras, dict) and cameras:
+            return cameras
+        sample_hz = metadata.get("sample_hz", 10)
+        inferred: dict[str, Any] = {}
+        frames_dir = recording_path / "frames"
+        if not frames_dir.is_dir():
+            return inferred
+        for camera_dir in sorted(path for path in frames_dir.iterdir() if path.is_dir()):
+            first = next(iter(sorted(camera_dir.glob("*.jpg"))), None)
+            width = height = 0
+            if first is not None:
+                image = cv2.imread(str(first), cv2.IMREAD_COLOR)
+                if image is not None:
+                    height, width = image.shape[:2]
+            inferred[camera_dir.name] = {
+                "name": camera_dir.name,
+                "width": width,
+                "height": height,
+                "fps": sample_hz,
+            }
+        return inferred
 
     def _recording_path_by_name(self, recording_id: str) -> Path:
         safe_name = Path(recording_id).name
@@ -1892,6 +1988,13 @@ class DashboardApp:
     def _model_rollout_path_by_name(self, rollout_id: str) -> Path:
         safe_name = Path(rollout_id).name
         path = self.model_rollout_dir / safe_name
+        if not path.is_dir():
+            raise FileNotFoundError(safe_name)
+        return path
+
+    def _synthetic_recording_path_by_name(self, recording_id: str) -> Path:
+        safe_name = Path(recording_id).name
+        path = self.synthetic_recording_dir / safe_name
         if not path.is_dir():
             raise FileNotFoundError(safe_name)
         return path
@@ -1919,6 +2022,83 @@ class DashboardApp:
             name=f"go-overhead-overlay-{recording_path.name}",
             daemon=True,
         ).start()
+
+    def _ensure_task_state(self, metadata: dict[str, Any]) -> None:
+        board = metadata.setdefault("board", {})
+        if board.get("task_state") is None:
+            board["task_state"] = self._task_state_from_delta(board.get("delta") or {}, board.get("target"))
+
+    @staticmethod
+    def _load_task_trace(recording_path: Path) -> list[dict[str, Any]]:
+        telemetry_path = recording_path / "telemetry.jsonl"
+        if not telemetry_path.is_file():
+            return []
+        trace: list[dict[str, Any]] = []
+        for fallback_index, line in enumerate(telemetry_path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            task_state = sample.get("task_state")
+            if not isinstance(task_state, dict):
+                task_state = {"done": bool(sample.get("done")), "reason": ""}
+            item = {
+                "index": int(sample.get("index", fallback_index)),
+                "done": bool(sample.get("done", task_state.get("done", False))),
+                "task_state": task_state,
+            }
+            trace.append(item)
+        return trace
+
+    @staticmethod
+    def _task_state_from_delta(
+        delta: dict[str, Any] | None,
+        target: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        delta = delta or {}
+        added = delta.get("added") or []
+        removed = delta.get("removed") or []
+        changed = delta.get("changed") or []
+        expected = target if isinstance(target, dict) and target.get("coord") else (added[0] if len(added) == 1 else None)
+        expected_coord = str(expected.get("coord", "")).upper() if isinstance(expected, dict) else ""
+        expected_color = str(expected.get("color", "")).lower() if isinstance(expected, dict) else ""
+        added_stone = added[0] if len(added) == 1 and isinstance(added[0], dict) else None
+        target_matches = bool(
+            added_stone
+            and str(added_stone.get("coord", "")).upper() == expected_coord
+            and str(added_stone.get("color", "")).lower() == expected_color
+        )
+        no_other_changes = bool(len(added) == 1 and not removed and not changed)
+        done = bool(target_matches and no_other_changes)
+        if done:
+            reason = "target occupied with correct colour and no other board changes"
+        elif len(added) != 1:
+            reason = f"expected one added stone, found {len(added)}"
+        elif removed or changed:
+            reason = "other board changes detected"
+        elif expected_coord and expected_color:
+            reason = "added stone does not match target"
+        else:
+            reason = "no target available"
+        return {
+            "done": done,
+            "target": None
+            if not expected_coord
+            else {
+                "coord": expected_coord,
+                "row": expected.get("row") if isinstance(expected, dict) else None,
+                "col": expected.get("col") if isinstance(expected, dict) else None,
+                "color": expected_color,
+            },
+            "reason": reason,
+            "delta": {
+                "added": len(added),
+                "removed": len(removed),
+                "changed": len(changed),
+            },
+        }
 
     @staticmethod
     def _move_name_from_delta(delta: dict[str, Any]) -> str:
@@ -2117,6 +2297,7 @@ class DashboardApp:
             "stone_max_radius_ratio": (0.2, 0.7),
             "stone_min_circularity": (0.25, 0.95),
             "stone_max_snap_distance_ratio": (0.15, 0.85),
+            "black_grid_min_edge_score": (0.12, 0.78),
             "overlay_fisheye_k": (-0.75, 0.75),
         }
         for name, (minimum, maximum) in tuning_fields.items():
@@ -2157,6 +2338,7 @@ class DashboardApp:
             self.board.stone_max_radius_ratio = defaults.stone_max_radius_ratio
             self.board.stone_min_circularity = defaults.stone_min_circularity
             self.board.stone_max_snap_distance_ratio = defaults.stone_max_snap_distance_ratio
+            self.board.black_grid_min_edge_score = defaults.black_grid_min_edge_score
             self.board.overlay_fisheye_k = defaults.overlay_fisheye_k
             return
         raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -2170,6 +2352,9 @@ class DashboardApp:
         self.board.stone_min_circularity = float(board.get("stone_min_circularity", defaults.stone_min_circularity))
         self.board.stone_max_snap_distance_ratio = float(
             board.get("stone_max_snap_distance_ratio", defaults.stone_max_snap_distance_ratio)
+        )
+        self.board.black_grid_min_edge_score = float(
+            board.get("black_grid_min_edge_score", defaults.black_grid_min_edge_score)
         )
         self.board.overlay_fisheye_k = float(board.get("overlay_fisheye_k", defaults.overlay_fisheye_k))
         if "corners_tl_tr_br_bl" in board:
@@ -2188,6 +2373,7 @@ class DashboardApp:
         board["stone_max_radius_ratio"] = self.board.stone_max_radius_ratio
         board["stone_min_circularity"] = self.board.stone_min_circularity
         board["stone_max_snap_distance_ratio"] = self.board.stone_max_snap_distance_ratio
+        board["black_grid_min_edge_score"] = self.board.black_grid_min_edge_score
         board["overlay_fisheye_k"] = self.board.overlay_fisheye_k
         board["corners_tl_tr_br_bl"] = self.board.corners_tl_tr_br_bl
         self.config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
@@ -2309,6 +2495,31 @@ class DashboardApp:
         json_path = self.annotation_dir / safe_name
         json_path.write_text(json.dumps(data, indent=2) + "\n")
         return {"ok": True, "file": safe_name, "annotation": data}
+
+    def delete_annotation(self, filename: str) -> dict[str, Any]:
+        loaded = self.get_annotation(filename)
+        safe_name = str(loaded["file"])
+        data = loaded["annotation"]
+
+        json_path = self.annotation_dir / safe_name
+        image_name = Path(str(data.get("image", ""))).name
+        image_path = self.annotation_dir / image_name if image_name else None
+
+        deleted: list[str] = []
+        if image_path is not None and image_path.is_file():
+            image_path.unlink()
+            deleted.append(image_path.name)
+        if json_path.is_file():
+            json_path.unlink()
+            deleted.append(json_path.name)
+
+        return {
+            "ok": True,
+            "file": safe_name,
+            "deleted": deleted,
+            "annotations": self.list_annotations()["annotations"],
+            "message": f"Deleted snapshot {safe_name}.",
+        }
 
     def annotation_overlay_jpeg(
         self,
@@ -2437,6 +2648,7 @@ class DashboardApp:
             stone_max_radius_ratio=self.board.stone_max_radius_ratio,
             stone_min_circularity=self.board.stone_min_circularity,
             stone_max_snap_distance_ratio=self.board.stone_max_snap_distance_ratio,
+            black_grid_min_edge_score=self.board.black_grid_min_edge_score,
             overlay_fisheye_k=self.board.overlay_fisheye_k,
         )
         return transform_board_state(state, self.board.camera_to_robot_rotation_degrees)
@@ -2464,6 +2676,7 @@ class DashboardApp:
                     "stone_max_radius_ratio": self.board.stone_max_radius_ratio,
                     "stone_min_circularity": self.board.stone_min_circularity,
                     "stone_max_snap_distance_ratio": self.board.stone_max_snap_distance_ratio,
+                    "black_grid_min_edge_score": self.board.black_grid_min_edge_score,
                 },
             }
 
@@ -2865,6 +3078,25 @@ HTML = r"""<!doctype html>
       grid-column: 1 / -1;
       width: 100%;
     }
+    .replay-state {
+      margin: 0 10px 8px;
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f7fafc;
+      color: var(--muted);
+      font-size: 12px;
+      display: none;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .replay-state.visible {
+      display: flex;
+    }
+    .replay-state strong {
+      color: var(--ink);
+      text-transform: capitalize;
+    }
     .recordings {
       margin: 0;
       padding: 0 10px 10px;
@@ -3169,6 +3401,7 @@ HTML = r"""<!doctype html>
             <button id="replay-button" type="button">Play</button>
             <input id="replay-slider" type="range" min="0" max="0" value="0" />
           </div>
+          <div id="recording-task-state" class="replay-state"></div>
           <div id="recording-note" class="note"></div>
           <div id="recording-delta" class="replay-delta"></div>
           <div class="recording-board-block">
@@ -3182,6 +3415,11 @@ HTML = r"""<!doctype html>
             <div id="recording-samples-board" class="sample-board"></div>
           </div>
           <ul id="recordings" class="recordings"></ul>
+          <div class="recording-board-title">
+            <span>Synthetic</span>
+            <span id="synthetic-recording-count">0 runs</span>
+          </div>
+          <ul id="synthetic-recordings" class="recordings"></ul>
         </section>
         <section class="panel">
           <div class="panel-title">
@@ -3291,6 +3529,7 @@ HTML = r"""<!doctype html>
     let replayTimer = null;
     let recordingsLoaded = [];
     let modelRolloutsLoaded = [];
+    let syntheticRecordingsLoaded = [];
     let modelDefaultsLoaded = false;
     let modelTransientNote = '';
     let modelTransientUntil = 0;
@@ -3329,7 +3568,12 @@ HTML = r"""<!doctype html>
 
     function cameraUrl(name) {
       if (replayRecording) {
-        const prefix = replayRecording.kind === 'model_rollout' ? 'model_rollout_frame' : 'recording_frame';
+        const prefix =
+          replayRecording.kind === 'model_rollout'
+            ? 'model_rollout_frame'
+            : replayRecording.kind === 'synthetic_recording'
+              ? 'synthetic_recording_frame'
+              : 'recording_frame';
         return `/api/${prefix}/${encodeURIComponent(replayRecording.id)}/${encodeURIComponent(name)}.jpg?frame=${replayFrame}&t=${Date.now()}`;
       }
       const activeModel = latestState?.model_run?.active;
@@ -3519,15 +3763,22 @@ HTML = r"""<!doctype html>
         document.getElementById('recording-state').textContent = `rec ${active.samples}`;
         document.getElementById('recording-note').textContent =
           `${Number(active.elapsed_s).toFixed(1)} s · ${active.samples} samples · ${recording.message || ''}`;
+        renderReplayTaskState(null);
         renderReplayDelta(null);
         return;
       }
       if (replayRecording) {
-        document.getElementById('recording-state').textContent = replayRecording.kind === 'model_rollout' ? 'model replay' : 'replay';
+        document.getElementById('recording-state').textContent =
+          replayRecording.kind === 'model_rollout'
+            ? 'model replay'
+            : replayRecording.kind === 'synthetic_recording'
+              ? 'synthetic replay'
+              : 'replay';
         return;
       }
       document.getElementById('recording-state').textContent = 'idle';
       document.getElementById('recording-note').textContent = recording?.message || 'Ready to record.';
+      renderReplayTaskState(null);
       renderReplayDelta(null);
     }
 
@@ -3742,6 +3993,13 @@ HTML = r"""<!doctype html>
       renderModelRollouts(modelRolloutsLoaded);
     }
 
+    async function refreshSyntheticRecordings() {
+      const response = await fetch('/api/synthetic_recordings', { cache: 'no-store' });
+      const result = await response.json().catch(() => ({ synthetic_recordings: [] }));
+      syntheticRecordingsLoaded = result.synthetic_recordings || [];
+      renderSyntheticRecordings(syntheticRecordingsLoaded);
+    }
+
     async function deleteRecording(id) {
       clearReplay();
       const button = document.querySelector(`[data-delete-recording="${CSS.escape(id)}"]`);
@@ -3779,7 +4037,7 @@ HTML = r"""<!doctype html>
         li.className = 'recording-row';
         li.classList.toggle(
           'selected',
-          replayRecording?.kind !== 'model_rollout' && (replayRecording?.id === item.id || replayRecording?.name === item.id),
+          replayRecording?.kind === 'recording' && (replayRecording?.id === item.id || replayRecording?.name === item.id),
         );
         const button = document.createElement('button');
         button.type = 'button';
@@ -3838,6 +4096,35 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function renderSyntheticRecordings(syntheticRecordings) {
+      const list = document.getElementById('synthetic-recordings');
+      const count = document.getElementById('synthetic-recording-count');
+      list.innerHTML = '';
+      count.textContent = `${syntheticRecordings.length} run${syntheticRecordings.length === 1 ? '' : 's'}`;
+      if (syntheticRecordings.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'note';
+        li.textContent = 'No synthetic recordings found.';
+        list.appendChild(li);
+        return;
+      }
+      for (const item of syntheticRecordings) {
+        const li = document.createElement('li');
+        li.className = 'recording-row';
+        li.classList.toggle(
+          'selected',
+          replayRecording?.kind === 'synthetic_recording' && (replayRecording?.id === item.id || replayRecording?.name === item.id),
+        );
+        const button = document.createElement('button');
+        button.type = 'button';
+        const success = item.synthetic?.success === true ? 'success' : item.synthetic?.success === false ? 'miss' : 'synthetic';
+        button.textContent = `${item.name}: ${item.samples} frames, ${item.move_name} · ${success}`;
+        button.addEventListener('click', () => loadSyntheticRecording(item.id));
+        li.appendChild(button);
+        list.appendChild(li);
+      }
+    }
+
     function recordingCameraNames(recording) {
       const cameras = recording?.cameras || {};
       if (Array.isArray(cameras)) return cameras;
@@ -3850,6 +4137,36 @@ HTML = r"""<!doctype html>
       if (status === 'processing') return 'processing overhead overlay...';
       if (status === 'error') return 'showing raw overhead; overlay processing failed';
       return 'showing raw overhead';
+    }
+
+    function taskStateForRecording(recording) {
+      if (!recording) return null;
+      const trace = Array.isArray(recording.task_trace) ? recording.task_trace : [];
+      const item = trace.find(entry => Number(entry.index) === Number(replayFrame)) || trace[replayFrame];
+      if (item) {
+        return item.task_state || { done: Boolean(item.done), reason: '' };
+      }
+      const target = recording?.board?.task_state?.target || recording?.task_state?.target || null;
+      return { done: false, target, reason: 'waiting for task completion' };
+    }
+
+    function renderReplayTaskState(recording) {
+      const root = document.getElementById('recording-task-state');
+      const taskState = taskStateForRecording(recording);
+      if (!recording || !taskState) {
+        root.className = 'replay-state';
+        root.innerHTML = '';
+        return;
+      }
+      const target = taskState.target || {};
+      const targetText = target.coord
+        ? `${escapeHtml(target.color || 'stone')} at ${escapeHtml(target.coord)}`
+        : 'target unknown';
+      root.className = 'replay-state visible';
+      root.innerHTML = `
+        <span>State: <strong>${taskState.done ? 'Done' : 'Not done'}</strong></span>
+        <span>${targetText} · ${escapeHtml(taskState.reason || '')}</span>
+      `;
     }
 
     async function loadRecording(id) {
@@ -3878,6 +4195,7 @@ HTML = r"""<!doctype html>
       updateReplayFrame();
       renderRecordings(recordingsLoaded);
       renderModelRollouts(modelRolloutsLoaded);
+      renderSyntheticRecordings(syntheticRecordingsLoaded);
       document.getElementById('recording-state').textContent = 'replay';
     }
 
@@ -3907,7 +4225,38 @@ HTML = r"""<!doctype html>
       updateReplayFrame();
       renderRecordings(recordingsLoaded);
       renderModelRollouts(modelRolloutsLoaded);
+      renderSyntheticRecordings(syntheticRecordingsLoaded);
       document.getElementById('recording-state').textContent = 'model replay';
+    }
+
+    async function loadSyntheticRecording(id) {
+      const response = await fetch(`/api/synthetic_recording?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('recording-note').textContent = result.error || 'Could not load synthetic recording.';
+        return;
+      }
+      stopReplayTimer();
+      replayRecording = { ...result.synthetic_recording, kind: 'synthetic_recording' };
+      replayFrame = 0;
+      const maxFrame = Math.max(0, Number(replayRecording.samples || 1) - 1);
+      const slider = document.getElementById('replay-slider');
+      slider.max = String(maxFrame);
+      slider.value = '0';
+      for (const camera of recordingCameraNames(replayRecording)) {
+        const meta = replayRecording.cameras?.[camera] || {};
+        ensureCamera({
+          name: camera,
+          width: meta.width || 0,
+          height: meta.height || 0,
+          fps: meta.fps || replayRecording.sample_hz || 10,
+        });
+      }
+      updateReplayFrame();
+      renderRecordings(recordingsLoaded);
+      renderModelRollouts(modelRolloutsLoaded);
+      renderSyntheticRecordings(syntheticRecordingsLoaded);
+      document.getElementById('recording-state').textContent = 'synthetic replay';
     }
 
     async function deleteModelRollout(id) {
@@ -3951,6 +4300,7 @@ HTML = r"""<!doctype html>
       if (replayRecording.kind === 'model_rollout') {
         document.getElementById('model-note').textContent = replayText;
       }
+      renderReplayTaskState(replayRecording);
       renderReplayDelta(replayRecording);
     }
 
@@ -3969,9 +4319,11 @@ HTML = r"""<!doctype html>
       slider.max = '0';
       slider.value = '0';
       document.getElementById('replay-button').textContent = 'Play';
+      renderReplayTaskState(null);
       renderReplayDelta(null);
       renderRecordings(recordingsLoaded);
       renderModelRollouts(modelRolloutsLoaded);
+      renderSyntheticRecordings(syntheticRecordingsLoaded);
     }
 
     function toggleReplay() {
@@ -4199,11 +4551,13 @@ HTML = r"""<!doctype html>
     setInterval(refreshState, 250);
     setInterval(refreshRecordings, 3000);
     setInterval(refreshModelRollouts, 3000);
+    setInterval(refreshSyntheticRecordings, 3000);
     refreshState().catch(() => {
       document.getElementById('status-text').textContent = 'Waiting';
     });
     refreshRecordings();
     refreshModelRollouts();
+    refreshSyntheticRecordings();
   </script>
 </body>
 </html>
@@ -4308,7 +4662,7 @@ ANNOTATION_HTML = r"""<!doctype html>
     .badge.bad { color: var(--red); border-color: #e7a39e; background: #fff3f2; }
     .workbench {
       display: grid;
-      grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+      grid-template-rows: auto auto auto auto auto minmax(320px, 1fr) auto;
       gap: 10px;
       padding: 0;
       min-height: 0;
@@ -4401,17 +4755,16 @@ ANNOTATION_HTML = r"""<!doctype html>
     .board-wrap {
       display: grid;
       place-items: center;
-      min-height: 0;
+      min-height: 320px;
       padding: 6px;
-      overflow: hidden;
-      container-type: size;
+      overflow: visible;
     }
     .board {
       --grid-pad: 5.2%;
       --grid-line: 3px;
       --grid-span: calc(100% - 2 * var(--grid-pad) - var(--grid-line));
       position: relative;
-      width: min(100cqw, 100cqh, 520px);
+      width: min(100%, 520px);
       aspect-ratio: 1;
       background: #d7a85d;
       border: 2px solid #5f3d1f;
@@ -4587,7 +4940,10 @@ ANNOTATION_HTML = r"""<!doctype html>
       list-style: none;
     }
     .saved li {
-      display: block;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      align-items: stretch;
     }
     .saved button {
       width: 100%;
@@ -4605,6 +4961,17 @@ ANNOTATION_HTML = r"""<!doctype html>
     .saved button:hover {
       border-color: var(--blue);
       background: #f2f7ff;
+    }
+    .saved button.delete-snapshot {
+      width: auto;
+      min-width: 68px;
+      text-align: center;
+      color: #a13b31;
+      background: #fffafa;
+    }
+    .saved button.delete-snapshot:hover {
+      border-color: #c84b40;
+      background: #fff0ee;
     }
     @media (max-width: 980px) {
       main {
@@ -4675,6 +5042,11 @@ ANNOTATION_HTML = r"""<!doctype html>
           <label for="tune-snap">Max snap dist</label>
           <input id="tune-snap" type="range" min="0.20" max="0.80" step="0.01" />
           <output id="tune-snap-value">-</output>
+        </div>
+        <div class="tuning-row">
+          <label for="tune-black-edge">Black edge req</label>
+          <input id="tune-black-edge" type="range" min="0.12" max="0.78" step="0.01" />
+          <output id="tune-black-edge-value">-</output>
         </div>
         <div class="tuning-row">
           <label for="tune-black">Black max L</label>
@@ -4763,6 +5135,7 @@ ANNOTATION_HTML = r"""<!doctype html>
       stone_max_radius_ratio: ['tune-max-radius', 'tune-max-radius-value', 2],
       stone_min_circularity: ['tune-circularity', 'tune-circularity-value', 2],
       stone_max_snap_distance_ratio: ['tune-snap', 'tune-snap-value', 2],
+      black_grid_min_edge_score: ['tune-black-edge', 'tune-black-edge-value', 2],
       black_l_threshold: ['tune-black', 'tune-black-value', 0],
       white_l_threshold: ['tune-white', 'tune-white-value', 0],
       white_s_threshold: ['tune-saturation', 'tune-saturation-value', 0],
@@ -5281,7 +5654,17 @@ ANNOTATION_HTML = r"""<!doctype html>
         button.title = 'View saved photo with metadata overlay';
         button.classList.toggle('active', selectedAnnotation?.file === item.file);
         button.addEventListener('click', () => openAnnotation(item.file));
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'delete-snapshot';
+        deleteButton.textContent = 'Delete';
+        deleteButton.title = 'Delete this saved snapshot and annotation';
+        deleteButton.addEventListener('click', event => {
+          event.stopPropagation();
+          deleteAnnotation(item.file);
+        });
         li.appendChild(button);
+        li.appendChild(deleteButton);
         list.appendChild(li);
       }
     }
@@ -5329,6 +5712,23 @@ ANNOTATION_HTML = r"""<!doctype html>
       }
       document.getElementById('message').textContent = `Saved metadata for ${result.file}.`;
       await openAnnotation(result.file, { forceReload: true });
+    }
+
+    async function deleteAnnotation(file) {
+      if (!window.confirm(`Delete snapshot ${file}?`)) return;
+      const response = await fetch('/api/annotations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', file }),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('message').textContent = result.error || 'Could not delete snapshot';
+        return;
+      }
+      if (selectedAnnotation?.file === file) returnToLiveCamera();
+      document.getElementById('message').textContent = result.message || `Deleted ${file}.`;
+      await refreshSaved();
     }
 
     function returnToLiveCamera() {
@@ -5421,6 +5821,9 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/model_rollouts":
                 self._send_bytes(json_bytes(app.list_model_rollouts()), "application/json")
                 return
+            if parsed.path == "/api/synthetic_recordings":
+                self._send_bytes(json_bytes(app.list_synthetic_recordings()), "application/json")
+                return
             if parsed.path == "/api/recording":
                 query = parse_qs(parsed.query)
                 recording_id = str(query.get("id", [""])[0])
@@ -5436,6 +5839,14 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                     self._send_bytes(json_bytes(app.get_model_rollout(rollout_id)), "application/json")
                 except FileNotFoundError:
                     self.send_error(HTTPStatus.NOT_FOUND, "Model rollout not found")
+                return
+            if parsed.path == "/api/synthetic_recording":
+                query = parse_qs(parsed.query)
+                recording_id = str(query.get("id", [""])[0])
+                try:
+                    self._send_bytes(json_bytes(app.get_synthetic_recording(recording_id)), "application/json")
+                except FileNotFoundError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Synthetic recording not found")
                 return
             if parsed.path.startswith("/api/recording_frame/") and parsed.path.endswith(".jpg"):
                 parts = [unquote(part) for part in parsed.path.split("/") if part]
@@ -5466,6 +5877,22 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                     jpeg = app.model_rollout_frame_jpeg(rollout_id, camera_name, frame_index)
                 except FileNotFoundError:
                     self.send_error(HTTPStatus.NOT_FOUND, "Model rollout frame not found")
+                    return
+                self._send_bytes(jpeg, "image/jpeg")
+                return
+            if parsed.path.startswith("/api/synthetic_recording_frame/") and parsed.path.endswith(".jpg"):
+                parts = [unquote(part) for part in parsed.path.split("/") if part]
+                if len(parts) != 4:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Synthetic recording frame not found")
+                    return
+                _api, _frame_prefix, recording_id, camera_file = parts
+                camera_name = Path(camera_file).stem
+                query = parse_qs(parsed.query)
+                frame_index = int(query.get("frame", ["0"])[0])
+                try:
+                    jpeg = app.synthetic_recording_frame_jpeg(recording_id, camera_name, frame_index)
+                except FileNotFoundError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Synthetic recording frame not found")
                     return
                 self._send_bytes(jpeg, "image/jpeg")
                 return
@@ -5603,6 +6030,14 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                         raise ValueError("Board action must be 'capture', 'delta', or 'detect'.")
                 elif parsed.path == "/api/board_tuning":
                     result = app.update_board_tuning(payload)
+                elif parsed.path == "/api/annotations":
+                    action = payload.get("action")
+                    if action == "delete":
+                        result = app.delete_annotation(str(payload.get("file", "")))
+                    elif action in {None, "", "save"}:
+                        result = app.save_annotation(payload)
+                    else:
+                        raise ValueError("Annotations action must be 'save' or 'delete'.")
                 elif parsed.path == "/api/annotation_metadata":
                     result = app.update_annotation_metadata(payload)
                 elif parsed.path == "/api/recording":
@@ -5694,6 +6129,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mock", action="store_true", help="Use mock camera feeds and mock robot telemetry.")
     parser.add_argument("--so101-port", help="Optional SO-101 follower serial port for live joint telemetry.")
+    parser.add_argument("--leader-port", help="Optional SO-101 leader serial port for live teleoperation.")
     parser.add_argument("--robot-id", default="go_dashboard_follower")
     parser.add_argument("--calibrate", action="store_true", help="Allow SO-101 calibration on connect if needed.")
     parser.add_argument("--urdf-path", help="Optional URDF path for forward kinematics.")
@@ -5703,6 +6139,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("examples/go_board/cv_snapshots"),
         help="Directory for annotated CV test snapshots.",
+    )
+    parser.add_argument(
+        "--synthetic-recording-dir",
+        type=Path,
+        default=DEFAULT_SYNTHETIC_RECORDING_DIR,
+        help="Directory containing generated synthetic recording folders.",
     )
     return parser
 
@@ -5748,7 +6190,7 @@ def main() -> None:
             robot_id=robot_id,
             calibrate=calibrate,
             configure_on_connect=configure_on_connect,
-            leader_port=config.leader.port,
+            leader_port=args.leader_port or config.leader.port,
             leader_id=config.leader.id,
             leader_calibrate=config.leader.calibrate,
             urdf_path=urdf_path,
@@ -5770,6 +6212,7 @@ def main() -> None:
         model=config.model,
         annotation_dir=args.annotation_dir,
         config_path=args.config,
+        synthetic_recording_dir=args.synthetic_recording_dir,
     )
     app.start()
 

@@ -17,7 +17,16 @@ import cv2
 import numpy as np
 import torch
 
-from detect_board_state import GO_COLUMNS, curved_grid_points_from_corners, inverse_transform_row_col
+from detect_board_state import (
+    BoardState,
+    GO_COLUMNS,
+    board_delta_to_jsonable,
+    board_state_from_image,
+    curved_grid_points_from_corners,
+    delta_between_board_states,
+    inverse_transform_row_col,
+    transform_board_state,
+)
 from process_overhead_recording import _draw_target_marker, _marker_radius
 from recording_dashboard import load_dashboard_config
 
@@ -35,7 +44,7 @@ from lerobot.robots.so_follower import SO101FollowerConfig
 from lerobot.rollout import BaseStrategyConfig, RolloutConfig, build_rollout_context
 from lerobot.rollout.inference import SyncInferenceConfig
 from lerobot.rollout.strategies import BaseStrategy
-from lerobot.utils.constants import OBS_STR
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.robot_utils import precise_sleep
@@ -149,6 +158,79 @@ def policy_image_size(policy_config: PreTrainedConfig) -> int:
     return 224
 
 
+def _coord_from_row_col(row: int, col: int, board_size: int) -> str:
+    columns = GO_COLUMNS if board_size == 19 else "".join(chr(ord("A") + i) for i in range(board_size))
+    return f"{columns[col]}{row + 1}"
+
+
+DONE_ENV_STATE_NAMES = ("done",)
+DEFAULT_DONE_STABLE_FRAMES = 5
+
+
+def _done_env_feature() -> dict[str, Any]:
+    return {
+        "dtype": "float32",
+        "shape": (len(DONE_ENV_STATE_NAMES),),
+        "names": list(DONE_ENV_STATE_NAMES),
+    }
+
+
+def _add_done_env_feature(dataset_features: dict[str, Any]) -> None:
+    dataset_features[OBS_ENV_STATE] = _done_env_feature()
+
+
+def _board_detection_kwargs_from_dashboard(config: Any) -> dict[str, Any]:
+    return {
+        "size": int(config.board.size),
+        "corners": np.array(config.board.corners_tl_tr_br_bl, dtype=np.float32),
+        "board_pixels": int(config.board.board_pixels),
+        "sample_radius_ratio": float(config.board.sample_radius_ratio),
+        "black_l_threshold": float(config.board.black_l_threshold),
+        "white_l_threshold": float(config.board.white_l_threshold),
+        "white_s_threshold": float(config.board.white_s_threshold),
+        "stone_min_radius_ratio": float(config.board.stone_min_radius_ratio),
+        "stone_max_radius_ratio": float(config.board.stone_max_radius_ratio),
+        "stone_min_circularity": float(config.board.stone_min_circularity),
+        "stone_max_snap_distance_ratio": float(config.board.stone_max_snap_distance_ratio),
+        "black_grid_min_edge_score": float(config.board.black_grid_min_edge_score),
+        "overlay_fisheye_k": float(config.board.overlay_fisheye_k),
+        "camera_to_robot_rotation_degrees": int(config.board.camera_to_robot_rotation_degrees),
+    }
+
+
+def _detect_board_state_from_frame(frame: np.ndarray, kwargs: dict[str, Any]) -> BoardState:
+    state = board_state_from_image(
+        frame,
+        corners=kwargs["corners"],
+        size=kwargs["size"],
+        board_pixels=kwargs["board_pixels"],
+        sample_radius_ratio=kwargs["sample_radius_ratio"],
+        black_l_threshold=kwargs["black_l_threshold"],
+        white_l_threshold=kwargs["white_l_threshold"],
+        white_s_threshold=kwargs["white_s_threshold"],
+        stone_min_radius_ratio=kwargs["stone_min_radius_ratio"],
+        stone_max_radius_ratio=kwargs["stone_max_radius_ratio"],
+        stone_min_circularity=kwargs["stone_min_circularity"],
+        stone_max_snap_distance_ratio=kwargs["stone_max_snap_distance_ratio"],
+        black_grid_min_edge_score=kwargs["black_grid_min_edge_score"],
+        overlay_fisheye_k=kwargs["overlay_fisheye_k"],
+    )
+    return transform_board_state(state, int(kwargs.get("camera_to_robot_rotation_degrees", 0)))
+
+
+def _delta_done_for_target(delta: dict[str, Any], target_coord: str, target_color: str) -> bool:
+    added = delta.get("added") or []
+    removed = delta.get("removed") or []
+    changed = delta.get("changed") or []
+    if len(added) != 1 or removed or changed:
+        return False
+    stone = added[0]
+    return (
+        str(stone.get("coord", "")).upper() == target_coord.upper()
+        and str(stone.get("color", "")).lower() == target_color.lower()
+    )
+
+
 class TargetOverlayObservationStep(ObservationProcessorStep):
     def __init__(
         self,
@@ -164,6 +246,8 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
         crop_left_right_ratio: float,
         preview_dir: Path | None = None,
         recording_dir: Path | None = None,
+        board_detection_kwargs: dict[str, Any] | None = None,
+        done_stable_frames: int = DEFAULT_DONE_STABLE_FRAMES,
     ) -> None:
         self.camera_name = camera_name
         self.board_size = board_size
@@ -179,6 +263,13 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
         self.recording_dir = recording_dir
         self.started_at: float | None = None
         self.sample_index = 0
+        self.board_detection_kwargs = board_detection_kwargs
+        self.target_coord = _coord_from_row_col(self.target_row, self.target_col, self.board_size)
+        self.baseline_state: BoardState | None = None
+        self.latest_task_state: dict[str, Any] | None = None
+        self.done_stable_frames = max(1, int(done_stable_frames))
+        self.done_candidate_count = 0
+        self.done_latched = False
 
     def observation(self, observation: RobotObservation) -> RobotObservation:
         frame = observation.get(self.camera_name)
@@ -186,6 +277,9 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
             return observation
         if not isinstance(frame, np.ndarray):
             raise TypeError(f"Expected camera '{self.camera_name}' to be a numpy array, got {type(frame)}.")
+
+        raw_target_frame = frame.copy()
+        self._update_done_state(observation, raw_target_frame)
 
         camera_row, camera_col = inverse_transform_row_col(
             self.target_row,
@@ -201,7 +295,9 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
         )
         center = points[camera_row][camera_col]
         radius = _marker_radius(points, camera_row, camera_col)
-        observation[self.camera_name] = _draw_target_marker(frame, center, radius, self.target_color)
+        target_frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        target_frame_bgr = _draw_target_marker(target_frame_bgr, center, radius, self.target_color)
+        observation[self.camera_name] = cv2.cvtColor(target_frame_bgr, cv2.COLOR_BGR2RGB)
         for name, value in list(observation.items()):
             if isinstance(value, np.ndarray) and value.ndim == 3:
                 observation[name] = crop_left_right_and_resize(
@@ -213,6 +309,53 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
 
     def transform_features(self, features: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return features
+
+    def _update_done_state(self, observation: RobotObservation, target_frame_rgb: np.ndarray) -> None:
+        task_state = {
+            "index": self.sample_index,
+            "done": False,
+            "target": {
+                "coord": self.target_coord,
+                "row": self.target_row,
+                "col": self.target_col,
+                "color": self.target_color,
+            },
+            "reason": "board detector unavailable",
+            "delta": None,
+        }
+        try:
+            if self.board_detection_kwargs is not None:
+                board_frame_bgr = cv2.cvtColor(target_frame_rgb, cv2.COLOR_RGB2BGR)
+                current_state = _detect_board_state_from_frame(board_frame_bgr, self.board_detection_kwargs)
+                if self.baseline_state is None:
+                    self.baseline_state = current_state
+                    task_state["reason"] = "baseline captured"
+                else:
+                    delta = board_delta_to_jsonable(delta_between_board_states(self.baseline_state, current_state))
+                    candidate_done = _delta_done_for_target(delta, self.target_coord, self.target_color)
+                    if not self.done_latched:
+                        self.done_candidate_count = self.done_candidate_count + 1 if candidate_done else 0
+                        self.done_latched = self.done_candidate_count >= self.done_stable_frames
+                    task_state["done"] = self.done_latched
+                    task_state["delta"] = {
+                        "added": len(delta.get("added") or []),
+                        "removed": len(delta.get("removed") or []),
+                        "changed": len(delta.get("changed") or []),
+                    }
+                    task_state["candidate_done"] = candidate_done
+                    task_state["stable_count"] = self.done_candidate_count
+                    task_state["stable_required"] = self.done_stable_frames
+                    task_state["reason"] = (
+                        f"target condition stable for {self.done_candidate_count}/{self.done_stable_frames} frames"
+                        if candidate_done and not self.done_latched
+                        else "target occupied with correct colour and no other board changes"
+                        if self.done_latched
+                        else "target is not the only board change"
+                    )
+        except Exception as exc:  # noqa: BLE001 - task telemetry should not stop policy rollout.
+            task_state["reason"] = f"board: {exc}"
+        self.latest_task_state = task_state
+        observation["done"] = 1.0 if task_state["done"] else 0.0
 
     def _write_preview_frames(self, observation: RobotObservation) -> None:
         if self.preview_dir is None:
@@ -257,6 +400,9 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
             "cameras": camera_files,
             "telemetry": {"joints": joint_values},
         }
+        if self.latest_task_state is not None:
+            sample["done"] = bool(self.latest_task_state["done"])
+            sample["task_state"] = self.latest_task_state
         telemetry_path = self.recording_dir / "telemetry.jsonl"
         with telemetry_path.open("a", encoding="utf-8") as telemetry_file:
             telemetry_file.write(json.dumps(sample, separators=(",", ":")) + "\n")
@@ -526,6 +672,7 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
         action_keys = [key for key in robot.action_features if key.endswith(".pos")]
         observation_features = _remote_observation_features(robot.observation_features, image_size)
         lerobot_features = hw_to_dataset_features(observation_features, OBS_STR, use_video=False)
+        _add_done_env_feature(lerobot_features)
         policy_setup = RemotePolicyConfig(
             policy_type=args.policy_type,
             pretrained_name_or_path=args.policy_path,
@@ -557,6 +704,8 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
             crop_left_right_ratio=args.crop_left_right_ratio,
             preview_dir=args.preview_dir,
             recording_dir=args.recording_dir,
+            board_detection_kwargs=_board_detection_kwargs_from_dashboard(config),
+            done_stable_frames=args.done_stable_frames,
         )
 
         control_interval = 1.0 / args.fps
@@ -682,6 +831,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--return-to-initial-duration", type=float, default=3.0)
     parser.add_argument("--return-to-initial-fps", type=float, default=50.0)
     parser.add_argument(
+        "--done-stable-frames",
+        type=int,
+        default=DEFAULT_DONE_STABLE_FRAMES,
+        help="Latch done only after the target-only board condition holds for this many consecutive frames.",
+    )
+    parser.add_argument(
         "--gripper-deadband",
         type=float,
         default=0.0,
@@ -755,6 +910,8 @@ def main() -> None:
                 crop_left_right_ratio=args.crop_left_right_ratio,
                 preview_dir=args.preview_dir,
                 recording_dir=args.recording_dir,
+                board_detection_kwargs=_board_detection_kwargs_from_dashboard(config),
+                done_stable_frames=args.done_stable_frames,
             )
         ],
         to_transition=observation_to_transition,
@@ -763,6 +920,7 @@ def main() -> None:
 
     signal_handler = ProcessSignalHandler(use_threads=True)
     context = build_rollout_context(cfg, signal_handler.shutdown_event, robot_observation_processor=overlay_processor)
+    _add_done_env_feature(context.data.dataset_features)
     strategy = TimedBaseStrategy(
         cfg.strategy,
         warn_threshold_s=args.timing_warn_threshold,
