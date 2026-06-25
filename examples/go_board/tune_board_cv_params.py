@@ -33,6 +33,7 @@ TUNING_KEYS = (
     "stone_max_radius_ratio",
     "stone_min_circularity",
     "stone_max_snap_distance_ratio",
+    "black_grid_min_edge_score",
 )
 
 
@@ -74,6 +75,7 @@ def load_config_params(path: Path) -> dict[str, float]:
         "stone_max_radius_ratio": 0.48,
         "stone_min_circularity": 0.45,
         "stone_max_snap_distance_ratio": 0.52,
+        "black_grid_min_edge_score": 0.18,
     }
     if not path.is_file():
         return defaults
@@ -298,6 +300,10 @@ def main() -> None:
         "stone_max_snap_distance_ratio": (
             max(0.2, start["stone_max_snap_distance_ratio"] - 0.18),
             min(0.85, start["stone_max_snap_distance_ratio"] + 0.18),
+        ),
+        "black_grid_min_edge_score": (
+            max(0.12, start["black_grid_min_edge_score"] - 0.2),
+            min(0.78, start["black_grid_min_edge_score"] + 0.2),
         ),
     }
     params, score = tune(cases, start, ranges, args.passes)

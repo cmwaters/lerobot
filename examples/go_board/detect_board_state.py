@@ -354,7 +354,11 @@ def classify_patch(
 
     black_contrast = (annulus_median_l - core_median_l) / 45.0
     white_contrast = (core_median_l - annulus_median_l) / 45.0
-    black_score = max(dark_fraction, black_contrast)
+    # A uniformly dark object crossing an intersection, such as the robot arm,
+    # can be just as dark as a black stone. Require the center to be darker than
+    # its surrounding board area so grid-local sampling does not accept darkness
+    # alone as a stone.
+    black_score = max(dark_fraction * np.clip(black_contrast / 0.35, 0.0, 1.0), black_contrast)
     white_score = max(
         bright_low_sat_fraction,
         white_contrast,
@@ -363,6 +367,7 @@ def classify_patch(
     if (
         dark_fraction > 0.55
         and median_l < black_l_threshold + 20
+        and black_contrast > 0.12
         and (black_score > white_score or dark_fraction > 0.85)
     ):
         return "black", float(np.clip(black_score, 0.0, 1.0))
@@ -429,6 +434,8 @@ def intersection_stone_candidates(
     to_image: np.ndarray,
     min_radius_ratio: float,
     max_radius_ratio: float,
+    min_circularity: float,
+    black_grid_min_edge_score: float,
     grid_points: list[list[tuple[float, float]]],
 ) -> list[Stone]:
     """Classify fixed grid intersections instead of running a global circle detector."""
@@ -453,9 +460,11 @@ def intersection_stone_candidates(
             edge_band = row in {0, 1, size - 2, size - 1} or col in {0, 1, size - 2, size - 1}
             min_color_confidence = 0.35 if edge_band else 0.45
             min_edge_score = 0.12 if edge_band else 0.18
+            if color == "black":
+                min_edge_score = max(min_edge_score, black_grid_min_edge_score)
             if color_confidence < min_color_confidence:
                 continue
-            if edge_score < min_edge_score and color_confidence < 0.72:
+            if edge_score < min_edge_score:
                 continue
 
             center_image_point = cv2.perspectiveTransform(
@@ -599,6 +608,7 @@ def detect_stones(
     stone_max_radius_ratio: float,
     stone_min_circularity: float,
     stone_max_snap_distance_ratio: float,
+    black_grid_min_edge_score: float,
     overlay_fisheye_k: float,
     skip_i: bool,
 ) -> tuple[list[Stone], np.ndarray, np.ndarray]:
@@ -642,6 +652,8 @@ def detect_stones(
         to_image=to_image,
         min_radius_ratio=stone_min_radius_ratio,
         max_radius_ratio=stone_max_radius_ratio,
+        min_circularity=stone_min_circularity,
+        black_grid_min_edge_score=black_grid_min_edge_score,
         grid_points=detector_grid_points,
     ):
         existing = stones_by_coord.get(stone.coord)
@@ -665,6 +677,7 @@ def board_state_from_image(
     stone_max_radius_ratio: float = 0.48,
     stone_min_circularity: float = 0.45,
     stone_max_snap_distance_ratio: float = 0.52,
+    black_grid_min_edge_score: float = 0.18,
     overlay_fisheye_k: float = 0.0,
     skip_i: bool = True,
 ) -> BoardState:
@@ -683,6 +696,7 @@ def board_state_from_image(
         stone_max_radius_ratio=stone_max_radius_ratio,
         stone_min_circularity=stone_min_circularity,
         stone_max_snap_distance_ratio=stone_max_snap_distance_ratio,
+        black_grid_min_edge_score=black_grid_min_edge_score,
         overlay_fisheye_k=overlay_fisheye_k,
         skip_i=skip_i,
     )
@@ -763,6 +777,7 @@ def delta_between_snapshots(
     stone_max_radius_ratio: float = 0.48,
     stone_min_circularity: float = 0.45,
     stone_max_snap_distance_ratio: float = 0.52,
+    black_grid_min_edge_score: float = 0.18,
     overlay_fisheye_k: float = 0.0,
     skip_i: bool = True,
 ) -> tuple[BoardState, BoardState, BoardDelta]:
@@ -780,6 +795,7 @@ def delta_between_snapshots(
         stone_max_radius_ratio=stone_max_radius_ratio,
         stone_min_circularity=stone_min_circularity,
         stone_max_snap_distance_ratio=stone_max_snap_distance_ratio,
+        black_grid_min_edge_score=black_grid_min_edge_score,
         overlay_fisheye_k=overlay_fisheye_k,
         skip_i=skip_i,
     )
@@ -796,6 +812,7 @@ def delta_between_snapshots(
         stone_max_radius_ratio=stone_max_radius_ratio,
         stone_min_circularity=stone_min_circularity,
         stone_max_snap_distance_ratio=stone_max_snap_distance_ratio,
+        black_grid_min_edge_score=black_grid_min_edge_score,
         overlay_fisheye_k=overlay_fisheye_k,
         skip_i=skip_i,
     )
@@ -867,6 +884,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.52,
         help="Maximum distance from candidate center to nearest intersection as grid-spacing ratio.",
     )
+    parser.add_argument(
+        "--black-grid-min-edge-score",
+        type=float,
+        default=0.18,
+        help="Minimum circular edge score for black stones found by grid-local sampling.",
+    )
     parser.add_argument("--overlay-fisheye-k", type=float, default=0.0, help="Curvature value for detector grid points.")
     parser.add_argument("--include-i", action="store_true", help="Do not skip column I in coordinates.")
     parser.add_argument("--json-output", type=Path, help="Optional path to write JSON board state.")
@@ -894,6 +917,7 @@ def main() -> None:
         stone_max_radius_ratio=args.stone_max_radius_ratio,
         stone_min_circularity=args.stone_min_circularity,
         stone_max_snap_distance_ratio=args.stone_max_snap_distance_ratio,
+        black_grid_min_edge_score=args.black_grid_min_edge_score,
         overlay_fisheye_k=args.overlay_fisheye_k,
         skip_i=not args.include_i,
     )

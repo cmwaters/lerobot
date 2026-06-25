@@ -54,6 +54,36 @@ def _single_added_target(metadata: dict[str, Any]) -> dict[str, Any]:
     return target
 
 
+def _target_metadata(target: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "coord": str(target["coord"]).upper(),
+        "row": int(target["row"]),
+        "col": int(target["col"]),
+        "color": str(target["color"]).lower(),
+    }
+
+
+def _load_done_by_frame(recording_dir: Path) -> dict[int, bool]:
+    telemetry_path = recording_dir / "telemetry.jsonl"
+    if not telemetry_path.is_file():
+        return {}
+    done_by_frame: dict[int, bool] = {}
+    for fallback_index, line in enumerate(telemetry_path.read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        index = int(sample.get("index", fallback_index))
+        task_state = sample.get("task_state")
+        if isinstance(task_state, dict) and "done" in task_state:
+            done_by_frame[index] = bool(task_state["done"])
+        elif "done" in sample:
+            done_by_frame[index] = bool(sample["done"])
+    return done_by_frame
+
+
 def _board_config(metadata: dict[str, Any]) -> tuple[int, np.ndarray, float, int, str]:
     board = metadata.get("board") or {}
     corners = board.get("corners_tl_tr_br_bl")
@@ -86,11 +116,11 @@ def _draw_target_marker(frame: np.ndarray, center: tuple[float, float], radius: 
     point = tuple(np.round(center).astype(int))
     normalized = color.lower()
     if normalized == "black":
-        fill = (15, 15, 15)
+        fill = (255, 80, 20)
         outline = (255, 255, 255)
     else:
-        fill = (245, 245, 245)
-        outline = (20, 20, 20)
+        fill = (20, 20, 245)
+        outline = (255, 255, 255)
     cv2.circle(output, point, radius + 4, outline, 3, cv2.LINE_AA)
     cv2.circle(output, point, radius, fill, -1, cv2.LINE_AA)
     return output
@@ -109,6 +139,8 @@ def process_recording_overhead(recording_dir: Path, force: bool = False, dry_run
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     target = _single_added_target(metadata)
+    target_meta = _target_metadata(target)
+    done_by_frame = _load_done_by_frame(recording_dir)
     board_size, corners, curve_k, rotation, camera_name = _board_config(metadata)
     raw_dir = recording_dir / "frames" / camera_name
     if not raw_dir.is_dir():
@@ -143,7 +175,7 @@ def process_recording_overhead(recording_dir: Path, force: bool = False, dry_run
             "status": "dry_run",
             "recording": recording_dir.name,
             "frames": len(raw_frames),
-            "target": target,
+            "target": target_meta,
             "camera_grid": {"row": camera_row, "col": camera_col},
             "processed_dir": str(processed_dir),
         }
@@ -152,18 +184,32 @@ def process_recording_overhead(recording_dir: Path, force: bool = False, dry_run
         for frame_path in processed_dir.glob("*.jpg"):
             frame_path.unlink()
     processed_dir.mkdir(parents=True, exist_ok=True)
-    _write_status(processed_dir, "processing", frames_total=len(raw_frames), target=target)
+    _write_status(
+        processed_dir,
+        "processing",
+        frames_total=len(raw_frames),
+        target=target_meta,
+        done_aware=True,
+    )
 
     try:
         written = 0
+        marked = 0
+        unmarked_after_done = 0
         for raw_frame in raw_frames:
             frame = cv2.imread(str(raw_frame), cv2.IMREAD_COLOR)
             if frame is None:
                 raise ValueError(f"Could not read frame {raw_frame}.")
-            points = curved_grid_points_from_corners(frame.shape, corners, board_size, curve_k)
-            center = points[camera_row][camera_col]
-            radius = _marker_radius(points, camera_row, camera_col)
-            output = _draw_target_marker(frame, center, radius, str(target["color"]))
+            frame_index = int(raw_frame.stem)
+            if done_by_frame.get(frame_index, False):
+                output = frame
+                unmarked_after_done += 1
+            else:
+                points = curved_grid_points_from_corners(frame.shape, corners, board_size, curve_k)
+                center = points[camera_row][camera_col]
+                radius = _marker_radius(points, camera_row, camera_col)
+                output = _draw_target_marker(frame, center, radius, str(target_meta["color"]))
+                marked += 1
             output_path = processed_dir / raw_frame.name
             if not cv2.imwrite(str(output_path), output, [int(cv2.IMWRITE_JPEG_QUALITY), 88]):
                 raise ValueError(f"Could not write processed frame {output_path}.")
@@ -173,7 +219,10 @@ def process_recording_overhead(recording_dir: Path, force: bool = False, dry_run
             "ready",
             frames_total=len(raw_frames),
             frames_written=written,
-            target=target,
+            frames_marked=marked,
+            frames_unmarked_after_done=unmarked_after_done,
+            target=target_meta,
+            done_aware=True,
         )
         return {
             "ok": True,
@@ -181,10 +230,12 @@ def process_recording_overhead(recording_dir: Path, force: bool = False, dry_run
             "recording": recording_dir.name,
             "processed_dir": str(processed_dir),
             "frames": written,
-            "target": target,
+            "frames_marked": marked,
+            "frames_unmarked_after_done": unmarked_after_done,
+            "target": target_meta,
         }
     except Exception as exc:
-        _write_status(processed_dir, "error", error=str(exc), target=target)
+        _write_status(processed_dir, "error", error=str(exc), target=target_meta, done_aware=True)
         raise
 
 

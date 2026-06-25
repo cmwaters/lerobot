@@ -200,6 +200,7 @@ def _approx_so101_xml(spec: ArmSpec) -> tuple[str, str, str]:
                     <joint name="wrist_roll" type="hinge" axis="1 0 0" range="-3.1416 3.1416" damping="0.15" armature="0.006"/>
                     {_box("wrist_roll_block", "0.014 0.018 0.014", "0.012 0 0", metal, mass=0.030)}
                     <body name="so101_gripper_palm" pos="{gripper:.5f} 0 0">
+                      <camera name="wrist" pos="-0.025 0 0.045" xyaxes="0 -1 0 0.35 0 0.94"/>
                       {_box("gripper_palm_geom", "0.018 0.024 0.010", "0 0 0", dark, mass=0.030)}
                       <body name="so101_left_finger" pos="0 {half_open:.5f} 0">
                         <joint name="gripper_left" type="slide" axis="0 1 0" range="0 0.030" damping="0.08"/>

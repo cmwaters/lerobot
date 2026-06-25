@@ -47,6 +47,7 @@ def load_config_tuning(path: Path | None) -> dict[str, float]:
         "stone_max_radius_ratio": 0.48,
         "stone_min_circularity": 0.45,
         "stone_max_snap_distance_ratio": 0.52,
+        "black_grid_min_edge_score": 0.18,
     }
     if path is None or not path.is_file():
         return defaults
