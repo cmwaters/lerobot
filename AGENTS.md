@@ -85,6 +85,11 @@ Treat this as an active local experiment, not generic LeRobot usage.
 
 ### Recording Data
 
+- Treat teleoperated raw recordings as append-only experimental data. Never
+  delete, prune, mirror with `--delete`, overwrite, or otherwise remove raw
+  recording directories unless the user explicitly asks for deletion of those
+  exact recordings. When aggregating laptop and desktop data, copy/merge
+  additively and preserve desktop-only or laptop-only recordings.
 - A valid training recording should add exactly one Go stone: one `added`
   delta, no `removed`, no `changed`.
 - Dashboard recordings live under `examples/go_board/recordings/<recording>/`

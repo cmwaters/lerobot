@@ -34,7 +34,7 @@ from lerobot.policies import (  # noqa: F401
     VQBeTConfig,
 )
 from lerobot.robots.robot import Robot
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.utils import init_logging
 
@@ -155,6 +155,8 @@ def prepare_raw_observation(
     image_keys = list(filter(is_image_key, lerobot_obs))
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
+    if OBS_ENV_STATE in lerobot_obs:
+        state_dict[OBS_ENV_STATE] = torch.tensor(lerobot_obs[OBS_ENV_STATE])
     image_dict = {
         image_k: extract_images_from_raw_observation(lerobot_obs, image_k) for image_k in image_keys
     }
