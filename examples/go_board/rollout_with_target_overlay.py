@@ -293,11 +293,12 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
             self.board_size,
             self.overlay_fisheye_k,
         )
-        center = points[camera_row][camera_col]
-        radius = _marker_radius(points, camera_row, camera_col)
-        target_frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        target_frame_bgr = _draw_target_marker(target_frame_bgr, center, radius, self.target_color)
-        observation[self.camera_name] = cv2.cvtColor(target_frame_bgr, cv2.COLOR_BGR2RGB)
+        if not self.done_latched:
+            center = points[camera_row][camera_col]
+            radius = _marker_radius(points, camera_row, camera_col)
+            target_frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            target_frame_bgr = _draw_target_marker(target_frame_bgr, center, radius, self.target_color)
+            observation[self.camera_name] = cv2.cvtColor(target_frame_bgr, cv2.COLOR_BGR2RGB)
         for name, value in list(observation.items()):
             if isinstance(value, np.ndarray) and value.ndim == 3:
                 observation[name] = crop_left_right_and_resize(
@@ -355,7 +356,10 @@ class TargetOverlayObservationStep(ObservationProcessorStep):
         except Exception as exc:  # noqa: BLE001 - task telemetry should not stop policy rollout.
             task_state["reason"] = f"board: {exc}"
         self.latest_task_state = task_state
-        observation["done"] = 1.0 if task_state["done"] else 0.0
+        done_state = np.array([1.0 if task_state["done"] else 0.0], dtype=np.float32)
+        observation["done"] = float(done_state[0])
+        observation["environment_state"] = done_state
+        observation[OBS_ENV_STATE] = done_state
 
     def _write_preview_frames(self, observation: RobotObservation) -> None:
         if self.preview_dir is None:
