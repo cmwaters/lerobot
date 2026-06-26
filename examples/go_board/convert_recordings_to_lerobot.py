@@ -22,6 +22,7 @@ from detect_board_state import (
     transform_board_state,
 )
 from lerobot.datasets import LeRobotDataset
+from process_overhead_recording import process_recording_overhead
 
 
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -29,6 +30,7 @@ DEFAULT_CROP_LEFT_RIGHT_RATIO = 0.10
 DONE_ENV_STATE_NAMES = ["done"]
 DEFAULT_DONE_STABLE_FRAMES = 5
 DEFAULT_BOARD_CONFIG = Path("examples/go_board/dashboard_config.json")
+RECORDING_MANIFEST_FILENAME = "go_recording_manifest.json"
 
 
 def _joint_vector(joints: list[dict[str, Any]], names: list[str]) -> np.ndarray | None:
@@ -257,44 +259,8 @@ def _future_follower_action(samples: list[dict[str, Any]], sample_index: int, of
     return _sample_joint_vector(samples[future_index], "joints")
 
 
-def iter_valid_recordings(recordings_dir: Path) -> list[Path]:
-    recordings = []
-    for metadata_path in sorted(recordings_dir.glob("*/metadata.json")):
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if _single_added_delta(metadata) is not None:
-            recordings.append(metadata_path.parent)
-    return recordings
-
-
-def convert_go_recordings(
-    recordings_dir: Path,
-    dataset_root: Path,
-    repo_id: str,
-    image_size: int = 224,
-    fps: int = 10,
-    force: bool = False,
-    max_episodes: int | None = None,
-    max_frames_per_episode: int | None = None,
-    pre_teleop_action: str = "skip",
-    future_action_offset: int = 1,
-    crop_left_right_ratio: float = DEFAULT_CROP_LEFT_RIGHT_RATIO,
-    include_done_env_state: bool = True,
-    done_stable_frames: int = DEFAULT_DONE_STABLE_FRAMES,
-    config_path: Path = DEFAULT_BOARD_CONFIG,
-) -> dict[str, Any]:
-    if pre_teleop_action not in {"skip", "future_follower"}:
-        raise ValueError("pre_teleop_action must be 'skip' or 'future_follower'.")
-    if future_action_offset < 1:
-        raise ValueError("future_action_offset must be at least 1.")
-    if crop_left_right_ratio < 0 or crop_left_right_ratio >= 0.5:
-        raise ValueError("crop_left_right_ratio must be >= 0 and < 0.5.")
-
-    if dataset_root.exists():
-        if not force:
-            raise FileExistsError(f"{dataset_root} already exists. Use --force to replace it.")
-        shutil.rmtree(dataset_root)
-
-    features = {
+def _dataset_features(image_size: int, include_done_env_state: bool) -> dict[str, dict[str, Any]]:
+    features: dict[str, dict[str, Any]] = {
         "observation.images.overhead": {
             "dtype": "image",
             "shape": (image_size, image_size, 3),
@@ -322,26 +288,184 @@ def convert_go_recordings(
             "shape": (len(DONE_ENV_STATE_NAMES),),
             "names": DONE_ENV_STATE_NAMES,
         }
+    return features
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _recording_manifest_path(dataset_root: Path) -> Path:
+    return dataset_root / RECORDING_MANIFEST_FILENAME
+
+
+def _manifest_recordings(dataset_root: Path) -> list[str]:
+    manifest = _load_json(_recording_manifest_path(dataset_root))
+    recordings = manifest.get("recordings")
+    if isinstance(recordings, list):
+        return [str(recording) for recording in recordings]
+
+    summary = _load_json(dataset_root / "go_conversion_summary.json")
+    source_recordings = summary.get("source_recordings")
+    if isinstance(source_recordings, list):
+        return [str(recording) for recording in source_recordings]
+    return []
+
+
+def _write_recording_manifest(
+    dataset_root: Path,
+    recordings: list[str],
+    *,
+    repo_id: str,
+    recordings_dir: Path,
+) -> None:
+    payload = {
+        "repo_id": repo_id,
+        "dataset_root": str(dataset_root),
+        "recordings_dir": str(recordings_dir),
+        "recordings": sorted(dict.fromkeys(recordings)),
+    }
+    _recording_manifest_path(dataset_root).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _create_or_resume_dataset(
+    *,
+    dataset_root: Path,
+    repo_id: str,
+    image_size: int,
+    fps: int,
+    force: bool,
+    only_missing: bool,
+    include_done_env_state: bool,
+) -> tuple[LeRobotDataset, list[str], str]:
+    if only_missing and force:
+        raise ValueError("--only-missing cannot be combined with --force.")
+
+    existing_recordings = _manifest_recordings(dataset_root)
+    if dataset_root.exists():
+        if only_missing:
+            dataset = LeRobotDataset.resume(
+                repo_id=repo_id,
+                root=dataset_root,
+                image_writer_threads=4,
+            )
+            return dataset, existing_recordings, "resume"
+        if not force:
+            raise FileExistsError(f"{dataset_root} already exists. Use --force to replace it, or --only-missing to append.")
+        shutil.rmtree(dataset_root)
+        existing_recordings = []
+
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
-        features=features,
+        features=_dataset_features(image_size, include_done_env_state),
         root=dataset_root,
         robot_type="so101",
         use_videos=False,
         image_writer_threads=4,
     )
+    return dataset, existing_recordings, "create"
+
+
+def _preprocess_overhead_recordings(
+    recordings: list[Path],
+    *,
+    enabled: bool,
+    force: bool,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"enabled": False, "processed": 0, "skipped": 0, "errors": []}
+
+    processed = 0
+    skipped = 0
+    errors = []
+    for recording_dir in tqdm(recordings, desc="Preparing overhead overlays"):
+        try:
+            result = process_recording_overhead(recording_dir, force=force)
+        except Exception as exc:  # noqa: BLE001 - continue through batch and report all bad recordings.
+            errors.append({"recording": recording_dir.name, "error": str(exc)})
+            continue
+        if result.get("skipped"):
+            skipped += 1
+        else:
+            processed += 1
+    if errors:
+        raise RuntimeError(f"Overhead preprocessing failed for {len(errors)} recording(s): {errors[:5]}")
+    return {"enabled": True, "processed": processed, "skipped": skipped, "errors": errors}
+
+
+def iter_valid_recordings(recordings_dir: Path) -> list[Path]:
+    recordings = []
+    for metadata_path in sorted(recordings_dir.glob("*/metadata.json")):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if _single_added_delta(metadata) is not None:
+            recordings.append(metadata_path.parent)
+    return recordings
+
+
+def convert_go_recordings(
+    recordings_dir: Path,
+    dataset_root: Path,
+    repo_id: str,
+    image_size: int = 224,
+    fps: int = 10,
+    force: bool = False,
+    max_episodes: int | None = None,
+    max_frames_per_episode: int | None = None,
+    pre_teleop_action: str = "skip",
+    future_action_offset: int = 1,
+    crop_left_right_ratio: float = DEFAULT_CROP_LEFT_RIGHT_RATIO,
+    include_done_env_state: bool = True,
+    done_stable_frames: int = DEFAULT_DONE_STABLE_FRAMES,
+    config_path: Path = DEFAULT_BOARD_CONFIG,
+    process_overhead: bool = True,
+    force_overhead: bool = False,
+    only_missing: bool = False,
+) -> dict[str, Any]:
+    if pre_teleop_action not in {"skip", "future_follower"}:
+        raise ValueError("pre_teleop_action must be 'skip' or 'future_follower'.")
+    if future_action_offset < 1:
+        raise ValueError("future_action_offset must be at least 1.")
+    if crop_left_right_ratio < 0 or crop_left_right_ratio >= 0.5:
+        raise ValueError("crop_left_right_ratio must be >= 0 and < 0.5.")
+
+    dataset, existing_recordings, dataset_mode = _create_or_resume_dataset(
+        dataset_root=dataset_root,
+        repo_id=repo_id,
+        image_size=image_size,
+        fps=fps,
+        force=force,
+        only_missing=only_missing,
+        include_done_env_state=include_done_env_state,
+    )
+    recorded_names = list(existing_recordings)
+    known_recordings = set(existing_recordings)
 
     recordings = iter_valid_recordings(recordings_dir)
     if max_episodes is not None:
         recordings = recordings[:max_episodes]
+    recordings_seen = len(recordings)
+    if only_missing:
+        recordings = [recording for recording in recordings if recording.name not in known_recordings]
 
     converted = 0
     skipped = []
     frames_total = 0
     teleop_frames_total = 0
     pre_teleop_frames_total = 0
+    overhead_summary: dict[str, Any] = {}
     try:
+        overhead_summary = _preprocess_overhead_recordings(
+            recordings,
+            enabled=process_overhead,
+            force=force_overhead,
+        )
         for recording_dir in tqdm(recordings, desc="Converting recordings"):
             metadata = json.loads((recording_dir / "metadata.json").read_text(encoding="utf-8"))
             target = _single_added_delta(metadata)
@@ -417,17 +541,38 @@ def convert_go_recordings(
             frames_total += episode_frames
             teleop_frames_total += episode_teleop_frames
             pre_teleop_frames_total += episode_pre_teleop_frames
+            recorded_names.append(recording_dir.name)
+            _write_recording_manifest(
+                dataset_root,
+                recorded_names,
+                repo_id=repo_id,
+                recordings_dir=recordings_dir,
+            )
     finally:
         dataset.finalize()
+
+    _write_recording_manifest(
+        dataset_root,
+        recorded_names,
+        repo_id=repo_id,
+        recordings_dir=recordings_dir,
+    )
 
     summary = {
         "repo_id": repo_id,
         "dataset_root": str(dataset_root),
-        "recordings_seen": len(recordings),
+        "recordings_seen": recordings_seen,
+        "recordings_selected": len(recordings),
+        "recordings_previously_present": len(existing_recordings),
         "episodes": converted,
         "frames": frames_total,
         "teleop_frames": teleop_frames_total,
         "pre_teleop_frames": pre_teleop_frames_total,
+        "dataset_mode": dataset_mode,
+        "only_missing": only_missing,
+        "source_recordings": sorted(dict.fromkeys(recorded_names)),
+        "new_source_recordings": [recording.name for recording in recordings if recording.name in set(recorded_names)],
+        "overhead_processing": overhead_summary,
         "pre_teleop_action": pre_teleop_action,
         "future_action_offset": future_action_offset,
         "skipped": skipped,
@@ -453,6 +598,23 @@ def main() -> None:
     parser.add_argument("--crop-left-right-ratio", type=float, default=DEFAULT_CROP_LEFT_RIGHT_RATIO)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--only-missing",
+        action="store_true",
+        help="Append only recordings present in --recordings-dir but absent from the dataset recording manifest.",
+    )
+    parser.add_argument(
+        "--skip-overhead-processing",
+        dest="process_overhead",
+        action="store_false",
+        default=True,
+        help="Skip the raw-overhead to overhead_processed red/blue target overlay stage.",
+    )
+    parser.add_argument(
+        "--force-overhead-processing",
+        action="store_true",
+        help="Regenerate overhead_processed frames before conversion, even when they already exist.",
+    )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-frames-per-episode", type=int, default=None)
     parser.add_argument(
@@ -498,6 +660,9 @@ def main() -> None:
         include_done_env_state=args.include_done_env_state,
         done_stable_frames=args.done_stable_frames,
         config_path=args.config,
+        process_overhead=args.process_overhead,
+        force_overhead=args.force_overhead_processing,
+        only_missing=args.only_missing,
     )
     print(json.dumps(summary, indent=2))
 
