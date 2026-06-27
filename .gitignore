@@ -166,6 +166,7 @@ wandb/
 data/
 outputs/
 examples/go_board/recordings/
+examples/go_board/recordings_not_done/
 examples/go_board/rejected_recordings/
 examples/go_board/model_rollouts/
 examples/go_board/runtime/
