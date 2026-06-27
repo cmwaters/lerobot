@@ -7,6 +7,8 @@ import argparse
 import json
 import math
 import shutil
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,26 @@ QUANTILES = {
     "q90": 0.90,
     "q99": 0.99,
 }
+
+
+def _meshless_urdf_path(urdf_path: Path) -> Path:
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    for link in root.findall("link"):
+        for tag in ("visual", "collision"):
+            for element in list(link.findall(tag)):
+                link.remove(element)
+
+    temp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=f"_{urdf_path.name}",
+        prefix="go_board_meshless_",
+        delete=False,
+        encoding="utf-8",
+    )
+    with temp:
+        tree.write(temp, encoding="unicode", xml_declaration=True)
+    return Path(temp.name)
 
 
 def _rotation_matrix_to_rpy_deg(rotation: np.ndarray) -> tuple[float, float, float]:
@@ -163,11 +185,15 @@ def convert_dataset_to_cartesian(
 ) -> dict[str, Any]:
     _validate_source_features(source_root)
     _copy_source_dataset(source_root, output_root, force=force)
-    kinematics = RobotKinematics(
-        urdf_path=str(urdf_path),
-        target_frame_name=target_frame_name,
-        joint_names=JOINT_NAMES,
-    )
+    kinematics_urdf_path = _meshless_urdf_path(urdf_path)
+    try:
+        kinematics = RobotKinematics(
+            urdf_path=str(kinematics_urdf_path),
+            target_frame_name=target_frame_name,
+            joint_names=JOINT_NAMES,
+        )
+    finally:
+        kinematics_urdf_path.unlink(missing_ok=True)
 
     data_files = sorted((output_root / "data").glob("chunk-*/*.parquet"))
     all_states = []
