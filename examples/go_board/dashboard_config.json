@@ -4,7 +4,7 @@
   "cameras": [
     {
       "name": "overhead",
-      "index_or_path": "/dev/v4l/by-id/usb-HD_Web_Camera_HD_Web_Camera_Ucamera001-video-index0",
+      "index_or_path": 1,
       "width": 1920,
       "height": 1080,
       "fps": 30,
@@ -13,7 +13,7 @@
     },
     {
       "name": "wrist",
-      "index_or_path": "/dev/v4l/by-id/usb-Innomaker_Innomaker-U20CAM-1080p-S1_SN0001-video-index0",
+      "index_or_path": 0,
       "width": 1920,
       "height": 1080,
       "fps": 30,
@@ -23,7 +23,7 @@
   ],
   "robot": {
     "type": "so101_follower",
-    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61036031-if00",
+    "port": "/dev/tty.usbmodem5B610360311",
     "id": "so101_follower",
     "calibrate": false,
     "configure_on_connect": false,
@@ -40,7 +40,7 @@
   },
   "leader": {
     "type": "so101_leader",
-    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6055931-if00",
+    "port": "/dev/tty.usbmodem5AE60559311",
     "id": "so101_leader",
     "calibrate": false
   },
@@ -49,7 +49,7 @@
     "size": 19,
     "corners_tl_tr_br_bl": [
       [
-        533.0,
+        539.0,
         272.0
       ],
       [
@@ -67,27 +67,30 @@
     ],
     "camera_to_robot_rotation_degrees": 270,
     "board_pixels": 1000,
-    "sample_radius_ratio": 0.34,
-    "black_l_threshold": 80.0,
+    "sample_radius_ratio": 0.42,
+    "black_l_threshold": 60.0,
     "white_l_threshold": 165.0,
     "white_s_threshold": 75.0,
-    "overlay_fisheye_k": -0.14,
-    "stone_min_radius_ratio": 0.24,
+    "overlay_fisheye_k": -0.18,
+    "stone_min_radius_ratio": 0.42,
     "stone_max_radius_ratio": 0.48,
     "stone_min_circularity": 0.45,
-    "stone_max_snap_distance_ratio": 0.52
+    "stone_max_snap_distance_ratio": 0.52,
+    "black_grid_min_edge_score": 0.2
   },
   "model": {
-    "policy_path": "outputs/train/act_go_board_v2/checkpoints/030000/pretrained_model",
+    "policy_path": "",
     "remote_host": "",
     "remote_workdir": "~/Developer/lerobot",
-    "remote_policy_server": "",
-    "policy_type": "act",
-    "actions_per_chunk": 20,
+    "remote_policy_server": "desktop:8080",
+    "policy_type": "diffusion",
+    "actions_per_chunk": 24,
     "policy_image_size": 224,
     "device": "cuda",
     "fps": 10,
     "duration_s": 10,
-    "release_local_devices": true
+    "gripper_deadband": 0,
+    "gripper_max_step": 0,
+    "release_local_devices": false
   }
 }

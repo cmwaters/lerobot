@@ -1,0 +1,21 @@
+{
+  "passed": 18,
+  "failed": 0,
+  "total": 18,
+  "errors": 0,
+  "missing": 0,
+  "extra": 0,
+  "wrong_color": 0,
+  "params": {
+    "sample_radius_ratio": 0.42,
+    "black_l_threshold": 60.0,
+    "white_l_threshold": 165.0,
+    "white_s_threshold": 75.0,
+    "stone_min_radius_ratio": 0.42,
+    "stone_max_radius_ratio": 0.48,
+    "stone_min_circularity": 0.45,
+    "stone_max_snap_distance_ratio": 0.52,
+    "black_grid_min_edge_score": 0.2
+  },
+  "failures": []
+}

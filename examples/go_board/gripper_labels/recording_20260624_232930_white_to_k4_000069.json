@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "updated_at": 1782383162.533661,
+  "kind": "recording",
+  "source_id": "20260624_232930_white_to_k4",
+  "frame": 69,
+  "label": "held",
+  "note": "",
+  "image": "frames/wrist/000069.jpg",
+  "image_shape": {
+    "width": 1920,
+    "height": 1080
+  },
+  "timestamp": 1782336577.244622,
+  "elapsed_s": 7.22876501083374,
+  "gripper_position": {
+    "follower": {
+      "value": 1.93,
+      "unit": "%",
+      "min_value": 0.0,
+      "max_value": 100.0
+    },
+    "leader": {
+      "value": 0.58,
+      "unit": "%",
+      "min_value": 0.0,
+      "max_value": 100.0
+    }
+  },
+  "joints": {
+    "follower": {
+      "shoulder_pan": {
+        "value": -47.47,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "shoulder_lift": {
+        "value": -3.21,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "elbow_flex": {
+        "value": 40.57,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "wrist_flex": {
+        "value": 35.3,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "wrist_roll": {
+        "value": -10.51,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "gripper": {
+        "value": 1.93,
+        "unit": "%",
+        "min_value": 0.0,
+        "max_value": 100.0
+      }
+    },
+    "leader": {
+      "shoulder_pan": {
+        "value": -46.95,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "shoulder_lift": {
+        "value": -7.38,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "elbow_flex": {
+        "value": 38.02,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "wrist_flex": {
+        "value": 36.84,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "wrist_roll": {
+        "value": -9.89,
+        "unit": "deg",
+        "min_value": -180.0,
+        "max_value": 180.0
+      },
+      "gripper": {
+        "value": 0.58,
+        "unit": "%",
+        "min_value": 0.0,
+        "max_value": 100.0
+      }
+    }
+  },
+  "detector": {
+    "holding": true,
+    "color": null,
+    "confidence": 1.0,
+    "circle": null,
+    "reason": "follower gripper 1.93% inside held range 1.00-2.00%"
+  },
+  "created_at": 1782383162.533661,
+  "image_detector": {
+    "holding": true,
+    "color": "black",
+    "confidence": 0.8492959770114943,
+    "circle": {
+      "x": 1422.0,
+      "y": 399.0,
+      "radius": 33.0
+    },
+    "reason": "L=11.5 S=80.1 stdL=5.6"
+  }
+}

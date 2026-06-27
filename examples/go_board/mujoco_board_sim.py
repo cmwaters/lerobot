@@ -32,7 +32,7 @@ class BoardSpec:
     size: int = 19
     spacing_m: float = 0.022
     margin_m: float = 0.028
-    thickness_m: float = 0.018
+    thickness_m: float = 0.038
     stone_radius_m: float = 0.0108
     stone_half_height_m: float = 0.0036
     board_friction: str = "1.2 0.02 0.001"
@@ -329,18 +329,19 @@ def build_scene_xml(
     ]
 
     stone_start_z = top_z + spec.stone_half_height_m * 4.0
+    bowl_y = board_y + half + 0.052
     if white_stone_pos is None:
-        white_stone_pos = (board_x - half - 0.055, board_y - 0.055, stone_start_z)
+        white_stone_pos = (board_x - 0.058, bowl_y, stone_start_z)
     stone_bodies = [
         _stone_body("white_stone", "white", white_stone_pos, spec),
-        _stone_body("black_stone", "black", (board_x - half - 0.055, board_y + 0.055, stone_start_z), spec),
+        _stone_body("black_stone", "black", (board_x + 0.058, bowl_y, stone_start_z), spec),
     ]
 
     left_bowl = _geom(
         "white_bowl",
         "cylinder",
         "0.042 0.012",
-        f"{board_x - half - 0.060:.5f} {board_y - 0.055:.5f} {top_z:.5f}",
+        f"{board_x - 0.058:.5f} {bowl_y:.5f} {top_z:.5f}",
         "0.82 0.82 0.78 0.45",
         friction=spec.board_friction,
     )
@@ -348,7 +349,7 @@ def build_scene_xml(
         "black_bowl",
         "cylinder",
         "0.042 0.012",
-        f"{board_x - half - 0.060:.5f} {board_y + 0.055:.5f} {top_z:.5f}",
+        f"{board_x + 0.058:.5f} {bowl_y:.5f} {top_z:.5f}",
         "0.12 0.12 0.12 0.45",
         friction=spec.board_friction,
     )
@@ -370,10 +371,7 @@ def build_scene_xml(
             <rgba haze="0.85 0.88 0.92 1"/>
           </visual>
           <asset>
-            <texture name="wood_tex" type="2d" builtin="checker"
-                     rgb1="0.76 0.52 0.25" rgb2="0.68 0.43 0.18"
-                     width="256" height="256" mark="edge" markrgb="0.25 0.14 0.05"/>
-            <material name="board_mat" texture="wood_tex" texrepeat="2 2"
+            <material name="board_mat" rgba="0.74 0.48 0.20 1"
                       specular="0.18" shininess="0.35"/>
           </asset>
           <worldbody>
@@ -383,8 +381,8 @@ def build_scene_xml(
             {_geom(
                 "table",
                 "box",
-                f"{half + 0.11:.5f} {half + 0.04:.5f} 0.01000",
-                f"{board_x - 0.035:.5f} {board_y:.5f} {-0.010:.5f}",
+                f"{half + 0.09:.5f} {half + 0.12:.5f} 0.01000",
+                f"{board_x:.5f} {board_y:.5f} {-0.010:.5f}",
                 "0.35 0.32 0.28 1",
                 friction=spec.board_friction,
             )}

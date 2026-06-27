@@ -422,11 +422,13 @@ class TimedBaseStrategy(BaseStrategy):
         warn_threshold_s: float = 0.05,
         action_trace: ActionTraceRecorder | None = None,
         gripper_guard: GripperCommandGuard | None = None,
+        done_check: Any | None = None,
     ) -> None:
         super().__init__(config)
         self.warn_threshold_s = warn_threshold_s
         self.action_trace = action_trace or ActionTraceRecorder(None)
         self.gripper_guard = gripper_guard or GripperCommandGuard()
+        self.done_check = done_check
 
     def _timed_send_next_action(
         self,
@@ -515,6 +517,9 @@ class TimedBaseStrategy(BaseStrategy):
             stage_start = time.perf_counter()
             obs_processed = self._process_observation_and_notify(ctx.processors, obs)
             timings["observation_processors"] = time.perf_counter() - stage_start
+            if self.done_check is not None and self.done_check():
+                logger.info("Target done condition reached; stopping rollout before timeout")
+                break
 
             if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
                 continue
@@ -734,6 +739,9 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
             observation["task"] = args.task or f"place {args.color} stone at {coord}"
             observation = overlay_processor.observation(observation)
             obs_time = time.perf_counter() - obs_start
+            if args.stop_on_done and overlay_processor.done_latched:
+                logger.info("Target done condition reached; stopping rollout before timeout")
+                break
 
             if not action_queue:
                 timed_observation = TimedObservation(
@@ -841,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Latch done only after the target-only board condition holds for this many consecutive frames.",
     )
     parser.add_argument(
+        "--stop-on-done",
+        action="store_true",
+        help="Stop the rollout as soon as the stable target condition is detected.",
+    )
+    parser.add_argument(
         "--gripper-deadband",
         type=float,
         default=0.0,
@@ -899,25 +912,24 @@ def main() -> None:
         task=args.task or f"place {args.color} stone at {coord}",
         display_data=args.display_data,
     )
+    overlay_step = TargetOverlayObservationStep(
+        camera_name=config.board.camera,
+        board_size=config.board.size,
+        corners_tl_tr_br_bl=config.board.corners_tl_tr_br_bl,
+        camera_to_robot_rotation_degrees=config.board.camera_to_robot_rotation_degrees,
+        overlay_fisheye_k=config.board.overlay_fisheye_k,
+        target_row=target_row,
+        target_col=target_col,
+        target_color=args.color,
+        image_size=image_size,
+        crop_left_right_ratio=args.crop_left_right_ratio,
+        preview_dir=args.preview_dir,
+        recording_dir=args.recording_dir,
+        board_detection_kwargs=_board_detection_kwargs_from_dashboard(config),
+        done_stable_frames=args.done_stable_frames,
+    )
     overlay_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
-        steps=[
-            TargetOverlayObservationStep(
-                camera_name=config.board.camera,
-                board_size=config.board.size,
-                corners_tl_tr_br_bl=config.board.corners_tl_tr_br_bl,
-                camera_to_robot_rotation_degrees=config.board.camera_to_robot_rotation_degrees,
-                overlay_fisheye_k=config.board.overlay_fisheye_k,
-                target_row=target_row,
-                target_col=target_col,
-                target_color=args.color,
-                image_size=image_size,
-                crop_left_right_ratio=args.crop_left_right_ratio,
-                preview_dir=args.preview_dir,
-                recording_dir=args.recording_dir,
-                board_detection_kwargs=_board_detection_kwargs_from_dashboard(config),
-                done_stable_frames=args.done_stable_frames,
-            )
-        ],
+        steps=[overlay_step],
         to_transition=observation_to_transition,
         to_output=transition_to_observation,
     )
@@ -933,6 +945,7 @@ def main() -> None:
             deadband=args.gripper_deadband,
             max_step=args.gripper_max_step,
         ),
+        done_check=(lambda: bool(args.stop_on_done and overlay_step.done_latched)),
     )
     try:
         strategy.setup(context)

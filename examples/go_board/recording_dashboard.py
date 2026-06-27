@@ -46,7 +46,20 @@ from process_overhead_recording import overhead_processed_status, process_record
 
 DEFAULT_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 MODEL_ROLLOUTS_DIR_NAME = "model_rollouts"
+MODEL_EVALUATIONS_DIR_NAME = "model_evaluations"
 DEFAULT_SYNTHETIC_RECORDING_DIR = Path("outputs/go_board_mujoco_nudge_robot_recordings")
+DEFAULT_EVALUATION_SEQUENCE = [
+    {"coord": "A1", "color": "black"},
+    {"coord": "T1", "color": "white"},
+    {"coord": "A19", "color": "white"},
+    {"coord": "T19", "color": "black"},
+    {"coord": "K1", "color": "black"},
+    {"coord": "K19", "color": "white"},
+    {"coord": "A10", "color": "white"},
+    {"coord": "T10", "color": "black"},
+    {"coord": "B2", "color": "white"},
+    {"coord": "S18", "color": "black"},
+]
 
 
 @dataclass
@@ -212,6 +225,26 @@ class ModelRunSession:
     baseline: BoardState | None = None
     baseline_image: str | None = None
     saved_rollout_name: str = ""
+    evaluation_id: str = ""
+    evaluation_index: int | None = None
+    stop_on_done: bool = False
+
+
+@dataclass
+class EvaluatorSession:
+    id: str
+    path: Path
+    commands: list[dict[str, str]]
+    payload: dict[str, Any]
+    started_at: float
+    ended_at: float | None = None
+    status: str = "starting"
+    index: int = 0
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    message: str = ""
+    error: str = ""
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
 
 
 def parse_camera_spec(value: str) -> CameraSpec:
@@ -911,6 +944,7 @@ class DashboardApp:
         config_path: Path | None = None,
         recording_dir: Path | None = None,
         model_rollout_dir: Path | None = None,
+        model_evaluation_dir: Path | None = None,
         synthetic_recording_dir: Path | None = None,
     ):
         self.cameras = {camera.spec.name: camera for camera in cameras}
@@ -921,6 +955,11 @@ class DashboardApp:
         self.recording_dir = recording_dir if recording_dir is not None else annotation_dir.parent / "recordings"
         self.model_rollout_dir = (
             model_rollout_dir if model_rollout_dir is not None else annotation_dir.parent / MODEL_ROLLOUTS_DIR_NAME
+        )
+        self.model_evaluation_dir = (
+            model_evaluation_dir
+            if model_evaluation_dir is not None
+            else annotation_dir.parent / MODEL_EVALUATIONS_DIR_NAME
         )
         self.synthetic_recording_dir = synthetic_recording_dir or DEFAULT_SYNTHETIC_RECORDING_DIR
         self.config_path = config_path
@@ -937,6 +976,10 @@ class DashboardApp:
         self.active_model_run: ModelRunSession | None = None
         self.last_model_run: ModelRunSession | None = None
         self.model_message = "Ready for policy rollout."
+        self.evaluator_lock = threading.Lock()
+        self.active_evaluator: EvaluatorSession | None = None
+        self.last_evaluator: EvaluatorSession | None = None
+        self.evaluator_message = "Ready to evaluate."
         self._migrate_model_rollouts_from_recordings()
 
     def _migrate_model_rollouts_from_recordings(self) -> None:
@@ -960,6 +1003,7 @@ class DashboardApp:
         self.telemetry.start()
 
     def stop(self) -> None:
+        self.stop_evaluator()
         self.stop_model_run()
         self.telemetry.stop()
         for camera in self.cameras.values():
@@ -1014,6 +1058,9 @@ class DashboardApp:
         with self.model_lock:
             if self.active_model_run is not None:
                 raise ValueError("A model rollout is already active.")
+        with self.evaluator_lock:
+            if self.active_evaluator is not None and not payload.get("evaluation_id"):
+                raise ValueError("An evaluator session is active.")
         with self.recording_lock:
             if self.active_recording is not None:
                 raise ValueError("Stop the recording before starting a model rollout.")
@@ -1043,6 +1090,7 @@ class DashboardApp:
         duration_s = float(payload.get("duration_s") or self.model.duration_s)
         gripper_deadband = float(payload.get("gripper_deadband") or self.model.gripper_deadband)
         gripper_max_step = float(payload.get("gripper_max_step") or self.model.gripper_max_step)
+        stop_on_done = bool(payload.get("stop_on_done", False))
         if actions_per_chunk <= 0:
             raise ValueError("Actions per chunk must be positive.")
         if policy_image_size <= 0:
@@ -1065,6 +1113,7 @@ class DashboardApp:
             run_id=preview_dir.name,
             coord=coord,
             color=color,
+            parent_dir=Path(str(payload.get("rollout_parent_dir"))) if payload.get("rollout_parent_dir") else None,
         )
         run = ModelRunSession(
             id=preview_dir.name,
@@ -1088,6 +1137,9 @@ class DashboardApp:
             rollout_dir=rollout_dir,
             baseline=baseline,
             baseline_image=baseline_image,
+            evaluation_id=str(payload.get("evaluation_id", "")),
+            evaluation_index=int(payload["evaluation_index"]) if payload.get("evaluation_index") is not None else None,
+            stop_on_done=stop_on_done,
         )
         run.command = self._model_run_command(run)
         run.command_display = self._command_display(run.command)
@@ -1110,9 +1162,16 @@ class DashboardApp:
             summary={"black": 0, "white": 0, "total": 0},
         )
 
-    def _create_model_rollout_dir(self, run_id: str, coord: str, color: str) -> tuple[Path, BoardState, str | None]:
+    def _create_model_rollout_dir(
+        self,
+        run_id: str,
+        coord: str,
+        color: str,
+        parent_dir: Path | None = None,
+    ) -> tuple[Path, BoardState, str | None]:
+        root = parent_dir or self.model_rollout_dir
         rollout_dir = self._unique_recording_path(
-            self.model_rollout_dir / f"{run_id}_model_{color}_to_{coord.lower()}"
+            root / f"{run_id}_model_{color}_to_{coord.lower()}"
         )
         rollout_dir.mkdir(parents=True, exist_ok=False)
         (rollout_dir / "frames").mkdir()
@@ -1255,6 +1314,8 @@ class DashboardApp:
                     f"--policy-image-size={run.policy_image_size}",
                 ]
             )
+        if run.stop_on_done:
+            rollout_args.append("--stop-on-done")
         if run.preview_dir is not None:
             rollout_args.append(f"--preview-dir={run.preview_dir}")
         if run.rollout_dir is not None:
@@ -1342,6 +1403,9 @@ class DashboardApp:
                 "error": run.error,
                 "log_tail": run.log_tail[-80:],
             }
+            if run.evaluation_id:
+                model_meta["evaluation_id"] = run.evaluation_id
+                model_meta["evaluation_index"] = run.evaluation_index
         metadata = {
             "schema_version": 1,
             "id": rollout_dir.name,
@@ -1373,6 +1437,12 @@ class DashboardApp:
             "error": run.error if run is not None else "",
             "model_run": model_meta,
         }
+        if run is not None and run.evaluation_id:
+            metadata["evaluation"] = {
+                "id": run.evaluation_id,
+                "index": run.evaluation_index,
+                "stop_on_done": run.stop_on_done,
+            }
         return metadata
 
     def _finalize_model_rollout(self, run: ModelRunSession) -> None:
@@ -1497,6 +1567,9 @@ class DashboardApp:
                 "available": run.preview_dir is not None and run.preview_dir.is_dir(),
             },
             "saved_rollout": run.saved_rollout_name,
+            "evaluation_id": run.evaluation_id,
+            "evaluation_index": run.evaluation_index,
+            "stop_on_done": run.stop_on_done,
         }
 
     def model_run_json(self) -> dict[str, Any]:
@@ -1507,6 +1580,217 @@ class DashboardApp:
                 "message": self.model_message,
                 "defaults": asdict(self.model),
             }
+
+    def start_evaluator(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.evaluator_lock:
+            if self.active_evaluator is not None:
+                raise ValueError("An evaluator session is already active.")
+        with self.model_lock:
+            if self.active_model_run is not None:
+                raise ValueError("Stop the active model rollout before starting evaluation.")
+        with self.recording_lock:
+            if self.active_recording is not None:
+                raise ValueError("Stop the recording before starting evaluation.")
+
+        commands = self._parse_evaluator_commands(payload.get("commands"))
+        run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        session_dir = self._unique_recording_path(self.model_evaluation_dir / f"{run_id}_ood_eval")
+        session_dir.mkdir(parents=True, exist_ok=False)
+        session = EvaluatorSession(
+            id=session_dir.name,
+            path=session_dir,
+            commands=commands,
+            payload=dict(payload),
+            started_at=time.time(),
+            status="running",
+            message="Starting evaluation...",
+        )
+        self._write_evaluator_summary(session)
+        with self.evaluator_lock:
+            self.active_evaluator = session
+            self.last_evaluator = session
+            self.evaluator_message = session.message
+        session.thread = threading.Thread(
+            target=self._evaluator_loop,
+            args=(session,),
+            name=f"go-evaluator-{session.id}",
+            daemon=True,
+        )
+        session.thread.start()
+        return {"ok": True, "evaluator": self._evaluator_status(session)}
+
+    def stop_evaluator(self) -> dict[str, Any]:
+        with self.evaluator_lock:
+            session = self.active_evaluator
+            if session is None:
+                return {"ok": True, "evaluator": self._evaluator_status(self.last_evaluator)}
+            session.stop_event.set()
+            self.evaluator_message = "Stopping evaluator..."
+        self.stop_model_run()
+        return {"ok": True, "evaluator": self._evaluator_status(session)}
+
+    def evaluator_json(self) -> dict[str, Any]:
+        with self.evaluator_lock:
+            return {
+                "active": self._evaluator_status(self.active_evaluator),
+                "last": self._evaluator_status(self.last_evaluator),
+                "message": self.evaluator_message,
+                "defaults": {
+                    **asdict(self.model),
+                    "commands": DEFAULT_EVALUATION_SEQUENCE,
+                    "duration_s": 30,
+                },
+            }
+
+    def _parse_evaluator_commands(self, raw_commands: Any) -> list[dict[str, str]]:
+        commands = raw_commands if isinstance(raw_commands, list) and raw_commands else DEFAULT_EVALUATION_SEQUENCE
+        parsed: list[dict[str, str]] = []
+        for raw in commands:
+            if not isinstance(raw, dict):
+                raise ValueError("Each evaluator command must be an object.")
+            coord = self._normalize_go_coord(str(raw.get("coord", "")))
+            color = str(raw.get("color", "white")).strip().lower() or "white"
+            if color not in {"black", "white"}:
+                raise ValueError("Evaluator command color must be 'black' or 'white'.")
+            parsed.append({"coord": coord, "color": color})
+        if len(parsed) != 10:
+            raise ValueError("Evaluator sequence must contain exactly 10 commands.")
+        return parsed
+
+    def _evaluator_loop(self, session: EvaluatorSession) -> None:
+        try:
+            for index, command in enumerate(session.commands):
+                if session.stop_event.is_set():
+                    session.status = "stopped"
+                    break
+                session.index = index
+                session.message = f"Running {index + 1}/{len(session.commands)}: {command['color']} to {command['coord']}."
+                with self.evaluator_lock:
+                    self.evaluator_message = session.message
+                run_payload = dict(session.payload)
+                run_payload.update(
+                    {
+                        "coord": command["coord"],
+                        "color": command["color"],
+                        "duration_s": 30,
+                        "stop_on_done": True,
+                        "rollout_parent_dir": str(session.path),
+                        "evaluation_id": session.id,
+                        "evaluation_index": index,
+                    }
+                )
+                self.start_model_run(run_payload)
+                with self.model_lock:
+                    run = self.active_model_run
+                while run is not None:
+                    if session.stop_event.is_set():
+                        self.stop_model_run()
+                    with self.model_lock:
+                        if self.active_model_run is not run:
+                            break
+                    time.sleep(0.2)
+
+                rest_result = self.move_follower_to_rest()
+                attempt = self._evaluator_attempt_from_run(index, command, run, rest_result)
+                session.attempts.append(attempt)
+                self._write_evaluator_summary(session)
+                with self.evaluator_lock:
+                    self.evaluator_message = (
+                        f"Completed {len(session.attempts)}/{len(session.commands)}: "
+                        f"{self._evaluator_success_count(session)}/{len(session.attempts)} succeeded."
+                    )
+                if session.stop_event.is_set():
+                    session.status = "stopped"
+                    break
+            else:
+                session.status = "complete"
+                session.message = (
+                    f"Evaluation complete: {self._evaluator_success_count(session)}/{len(session.commands)} succeeded."
+                )
+        except Exception as exc:
+            session.status = "error"
+            session.error = str(exc)
+            session.message = f"Evaluator error: {exc}"
+        finally:
+            session.ended_at = time.time()
+            self._write_evaluator_summary(session)
+            with self.evaluator_lock:
+                if self.active_evaluator is session:
+                    self.active_evaluator = None
+                self.last_evaluator = session
+                self.evaluator_message = session.message or self.evaluator_message
+
+    def _evaluator_attempt_from_run(
+        self,
+        index: int,
+        command: dict[str, str],
+        run: ModelRunSession | None,
+        rest_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        rollout_name = ""
+        rollout_path = run.rollout_dir if run is not None else None
+        if rollout_path is not None and (rollout_path / "metadata.json").is_file():
+            metadata = json.loads((rollout_path / "metadata.json").read_text(encoding="utf-8"))
+            rollout_name = rollout_path.name
+        board = metadata.get("board", {})
+        task_state = board.get("task_state") or self._task_state_from_delta(board.get("delta"), board.get("target"))
+        timed_out = bool(run is not None and run.returncode == 0 and not task_state.get("done") and run.duration_s >= 30)
+        attempt = {
+            "index": index,
+            "coord": command["coord"],
+            "color": command["color"],
+            "success": bool(task_state.get("done")),
+            "status": "success" if task_state.get("done") else "failed",
+            "reason": task_state.get("reason", ""),
+            "timed_out": timed_out,
+            "rollout": rollout_name,
+            "returncode": None if run is None else run.returncode,
+            "rest": rest_result,
+        }
+        if rollout_path is not None and metadata:
+            metadata["evaluation_attempt"] = attempt
+            metadata["rest_result"] = rest_result
+            (rollout_path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        return attempt
+
+    @staticmethod
+    def _evaluator_success_count(session: EvaluatorSession) -> int:
+        return sum(1 for attempt in session.attempts if attempt.get("success"))
+
+    def _write_evaluator_summary(self, session: EvaluatorSession) -> None:
+        payload = {
+            "schema_version": 1,
+            "id": session.id,
+            "status": session.status,
+            "started_at": session.started_at,
+            "ended_at": session.ended_at,
+            "commands": session.commands,
+            "attempts": session.attempts,
+            "successes": self._evaluator_success_count(session),
+            "failures": len(session.attempts) - self._evaluator_success_count(session),
+            "message": session.message,
+            "error": session.error,
+        }
+        (session.path / "summary.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def _evaluator_status(self, session: EvaluatorSession | None) -> dict[str, Any] | None:
+        if session is None:
+            return None
+        return {
+            "id": session.id,
+            "directory": str(session.path),
+            "status": session.status,
+            "index": session.index,
+            "total": len(session.commands),
+            "elapsed_s": round(time.time() - session.started_at, 2),
+            "commands": session.commands,
+            "attempts": session.attempts,
+            "successes": self._evaluator_success_count(session),
+            "failures": len(session.attempts) - self._evaluator_success_count(session),
+            "message": session.message,
+            "error": session.error,
+        }
 
     def _normalize_go_coord(self, value: str) -> str:
         text = value.strip().upper()
@@ -2044,10 +2328,21 @@ class DashboardApp:
             task_state = sample.get("task_state")
             if not isinstance(task_state, dict):
                 task_state = {"done": bool(sample.get("done")), "reason": ""}
+            telemetry = sample.get("telemetry")
+            if not isinstance(telemetry, dict):
+                telemetry = {}
             item = {
                 "index": int(sample.get("index", fallback_index)),
                 "done": bool(sample.get("done", task_state.get("done", False))),
                 "task_state": task_state,
+                "telemetry": {
+                    "joints": telemetry.get("joints") if isinstance(telemetry.get("joints"), list) else [],
+                    "leader_joints": (
+                        telemetry.get("leader_joints") if isinstance(telemetry.get("leader_joints"), list) else []
+                    ),
+                    "mode": telemetry.get("mode", ""),
+                    "fps": telemetry.get("fps", None),
+                },
             }
             trace.append(item)
         return trace
@@ -2718,6 +3013,7 @@ class DashboardApp:
             "message": message,
         }
         state["model_run"] = self.model_run_json()
+        state["evaluator"] = self.evaluator_json()
         return state
 
 
@@ -3386,6 +3682,7 @@ HTML = r"""<!doctype html>
           </div>
           <div class="controls">
             <button id="refresh-devices-button" type="button">Refresh Devices</button>
+            <a class="session-link" href="/evaluate">Evaluate</a>
             <a class="session-link" href="/annotate">Annotate</a>
           </div>
           <div id="note" class="note"></div>
@@ -3637,6 +3934,34 @@ HTML = r"""<!doctype html>
       document.getElementById(countId).textContent = joints.length;
     }
 
+    function replayTraceEntry(recording) {
+      if (!recording) return null;
+      const trace = Array.isArray(recording.task_trace) ? recording.task_trace : [];
+      return trace.find(entry => Number(entry.index) === Number(replayFrame)) || trace[replayFrame] || null;
+    }
+
+    function replayTelemetryState(recording) {
+      const entry = replayTraceEntry(recording);
+      const telemetry = entry?.telemetry || {};
+      const joints = Array.isArray(telemetry.joints) ? telemetry.joints : [];
+      const leaderJoints = Array.isArray(telemetry.leader_joints) ? telemetry.leader_joints : [];
+      return {
+        timestamp: Date.now() / 1000,
+        connected: false,
+        mode: telemetry.mode || `${recording?.kind || 'recording'} replay`,
+        fps: telemetry.fps || recording?.sample_hz || 0,
+        joints,
+        leader_joints: leaderJoints,
+        teleop_enabled: false,
+      };
+    }
+
+    function updateReplayJoints(recording) {
+      const replayState = replayTelemetryState(recording);
+      updateJoints(replayState.joints, 'joints', 'joint-count');
+      updateJoints(replayState.leader_joints, 'leader-joints', 'leader-joint-count', buildLeaderDeltaMap(replayState));
+    }
+
     function updateAlignment(state) {
       const followerByName = new Map(state.joints.map(joint => [joint.name, joint]));
       const leaderByName = new Map(state.leader_joints.map(joint => [joint.name, joint]));
@@ -3710,9 +4035,13 @@ HTML = r"""<!doctype html>
       document.getElementById('teleop-note').textContent = canTeleop
         ? 'Align the leader and follower before starting; Start Teleop sends leader joint targets to the follower.'
         : 'Connect leader and follower telemetry before teleoperation.';
-      const leaderDeltaMap = buildLeaderDeltaMap(state);
-      updateJoints(state.joints, 'joints', 'joint-count');
-      updateJoints(state.leader_joints, 'leader-joints', 'leader-joint-count', leaderDeltaMap);
+      if (replayRecording) {
+        updateReplayJoints(replayRecording);
+      } else {
+        const leaderDeltaMap = buildLeaderDeltaMap(state);
+        updateJoints(state.joints, 'joints', 'joint-count');
+        updateJoints(state.leader_joints, 'leader-joints', 'leader-joint-count', leaderDeltaMap);
+      }
       updateAlignment(state);
       updateRecording(state.recording);
       updateModelRun(state.model_run);
@@ -4141,8 +4470,7 @@ HTML = r"""<!doctype html>
 
     function taskStateForRecording(recording) {
       if (!recording) return null;
-      const trace = Array.isArray(recording.task_trace) ? recording.task_trace : [];
-      const item = trace.find(entry => Number(entry.index) === Number(replayFrame)) || trace[replayFrame];
+      const item = replayTraceEntry(recording);
       if (item) {
         return item.task_state || { done: Boolean(item.done), reason: '' };
       }
@@ -4302,6 +4630,7 @@ HTML = r"""<!doctype html>
       }
       renderReplayTaskState(replayRecording);
       renderReplayDelta(replayRecording);
+      updateReplayJoints(replayRecording);
     }
 
     function stopReplayTimer() {
@@ -4558,6 +4887,432 @@ HTML = r"""<!doctype html>
     refreshRecordings();
     refreshModelRollouts();
     refreshSyntheticRecordings();
+  </script>
+</body>
+</html>
+"""
+
+
+EVALUATOR_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Go Model Evaluator</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --line: #d8dee3;
+      --text: #182026;
+      --muted: #66727c;
+      --teal: #0f766e;
+      --amber: #b7791f;
+      --red: #b42318;
+      --blue: #2364aa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 0 18px;
+      background: #fff;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 16px; line-height: 1; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
+      gap: 14px;
+      padding: 14px;
+      min-height: calc(100vh - 56px);
+    }
+    .panel {
+      min-width: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-title {
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .session-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      text-decoration: none;
+    }
+    .form {
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .wide { grid-column: 1 / -1; }
+    label {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    input,
+    select {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 9px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 9px 12px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary { color: #fff; border-color: var(--teal); background: var(--teal); }
+    button.danger { color: var(--red); border-color: #e7a39e; }
+    button:disabled { color: var(--muted); cursor: not-allowed; background: #edf1f3; }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      padding: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      min-width: 0;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 11px; }
+    .metric strong { display: block; font-size: 20px; line-height: 1.25; overflow-wrap: anywhere; }
+    .note {
+      min-height: 26px;
+      padding: 0 10px 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th,
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 11px;
+      line-height: 1.4;
+      background: #f7fafb;
+      white-space: nowrap;
+    }
+    .badge.ok { color: var(--teal); border-color: #9fd8d2; background: #eefaf8; }
+    .badge.warn { color: var(--amber); border-color: #e8c780; background: #fff8e8; }
+    .badge.bad { color: var(--red); border-color: #e7a39e; background: #fff3f2; }
+    .sequence {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      padding: 10px;
+    }
+    .cmd {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcfd;
+      font-size: 12px;
+      min-width: 0;
+    }
+    .cmd strong { display: block; font-size: 16px; }
+    .cmd span { color: var(--muted); }
+    .results {
+      display: grid;
+      gap: 14px;
+    }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .sequence { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Go Model Evaluator</h1>
+    <a class="session-link" href="/">Back to Recording</a>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panel-title">
+        <span>Run</span>
+        <span id="status">idle</span>
+      </div>
+      <div class="form">
+        <div class="grid">
+          <label class="wide">Policy Path
+            <input id="policy-path" autocomplete="off" />
+          </label>
+          <label class="wide">Remote Policy Server
+            <input id="remote-policy-server" autocomplete="off" placeholder="desktop:8080" />
+          </label>
+          <label>Policy Type
+            <input id="policy-type" autocomplete="off" />
+          </label>
+          <label>Action Chunk
+            <input id="actions-per-chunk" type="number" min="1" step="1" />
+          </label>
+          <label>Image Size
+            <input id="policy-image-size" type="number" min="1" step="1" />
+          </label>
+          <label>Device
+            <input id="device" autocomplete="off" />
+          </label>
+          <label>FPS
+            <input id="fps" type="number" min="1" step="1" />
+          </label>
+          <label>Grip Deadband
+            <input id="gripper-deadband" type="number" min="0" step="0.1" />
+          </label>
+          <label>Grip Max Step
+            <input id="gripper-max-step" type="number" min="0" step="0.1" />
+          </label>
+        </div>
+        <div class="actions">
+          <button id="start" class="primary" type="button">Start Evaluation</button>
+          <button id="stop" class="danger" type="button">Stop</button>
+        </div>
+      </div>
+      <div id="message" class="note"></div>
+    </section>
+    <section class="results">
+      <section class="panel">
+        <div class="panel-title">
+          <span>Summary</span>
+          <span id="directory">-</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span>Success</span><strong id="successes">0</strong></div>
+          <div class="metric"><span>Failed</span><strong id="failures">0</strong></div>
+          <div class="metric"><span>Progress</span><strong id="progress">0/10</strong></div>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Sequence</span>
+          <span>OOD 10</span>
+        </div>
+        <div id="sequence" class="sequence"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Results</span>
+          <span id="elapsed">-</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Move</th>
+              <th>Status</th>
+              <th>Reason</th>
+              <th>Rollout</th>
+            </tr>
+          </thead>
+          <tbody id="results"></tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+  <script>
+    let defaultsLoaded = false;
+    let commands = [];
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      }[ch]));
+    }
+
+    function payload() {
+      return {
+        action: 'start',
+        commands,
+        policy_path: document.getElementById('policy-path').value,
+        remote_policy_server: document.getElementById('remote-policy-server').value,
+        policy_type: document.getElementById('policy-type').value,
+        actions_per_chunk: Number(document.getElementById('actions-per-chunk').value || 20),
+        policy_image_size: Number(document.getElementById('policy-image-size').value || 224),
+        device: document.getElementById('device').value,
+        fps: Number(document.getElementById('fps').value || 10),
+        gripper_deadband: Number(document.getElementById('gripper-deadband').value || 0),
+        gripper_max_step: Number(document.getElementById('gripper-max-step').value || 0),
+      };
+    }
+
+    function renderSequence(activeIndex, attempts) {
+      const root = document.getElementById('sequence');
+      const byIndex = new Map((attempts || []).map(item => [Number(item.index), item]));
+      root.innerHTML = '';
+      commands.forEach((command, index) => {
+        const attempt = byIndex.get(index);
+        const div = document.createElement('div');
+        div.className = 'cmd';
+        const state = attempt ? (attempt.success ? 'ok' : 'bad') : index === activeIndex ? 'warn' : '';
+        div.innerHTML = `
+          <strong>${index + 1}. ${escapeHtml(command.coord)}</strong>
+          <span>${escapeHtml(command.color)} ${state ? `· ${state === 'ok' ? 'success' : state === 'bad' ? 'failed' : 'running'}` : ''}</span>
+        `;
+        root.appendChild(div);
+      });
+    }
+
+    function renderResults(evaluator) {
+      const tbody = document.getElementById('results');
+      const attempts = evaluator?.attempts || [];
+      tbody.innerHTML = '';
+      for (const attempt of attempts) {
+        const tr = document.createElement('tr');
+        const status = attempt.success ? 'ok' : attempt.timed_out ? 'warn' : 'bad';
+        tr.innerHTML = `
+          <td>${Number(attempt.index) + 1}</td>
+          <td>${escapeHtml(attempt.color)} to ${escapeHtml(attempt.coord)}</td>
+          <td><span class="badge ${status}">${attempt.success ? 'succeeded' : attempt.timed_out ? 'timed out' : 'failed'}</span></td>
+          <td>${escapeHtml(attempt.reason || '')}</td>
+          <td>${escapeHtml(attempt.rollout || '')}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+      if (attempts.length === 0) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="5">No attempts yet.</td>';
+        tbody.appendChild(tr);
+      }
+    }
+
+    function update(data) {
+      const evaluator = data.active || data.last || null;
+      const defaults = data.defaults || {};
+      if (!defaultsLoaded) {
+        commands = defaults.commands || [];
+        document.getElementById('policy-path').value = defaults.policy_path || '';
+        document.getElementById('remote-policy-server').value = defaults.remote_policy_server || '';
+        document.getElementById('policy-type').value = defaults.policy_type || 'act';
+        document.getElementById('actions-per-chunk').value = defaults.actions_per_chunk || 20;
+        document.getElementById('policy-image-size').value = defaults.policy_image_size || 224;
+        document.getElementById('device').value = defaults.device || 'cuda';
+        document.getElementById('fps').value = defaults.fps || 10;
+        document.getElementById('gripper-deadband').value = defaults.gripper_deadband || 0;
+        document.getElementById('gripper-max-step').value = defaults.gripper_max_step || 0;
+        defaultsLoaded = true;
+      }
+      const active = Boolean(data.active);
+      document.getElementById('status').textContent = evaluator?.status || 'idle';
+      document.getElementById('message').textContent = evaluator?.message || data.message || '';
+      document.getElementById('directory').textContent = evaluator?.directory || '-';
+      document.getElementById('successes').textContent = evaluator?.successes ?? 0;
+      document.getElementById('failures').textContent = evaluator?.failures ?? 0;
+      document.getElementById('progress').textContent = `${evaluator?.attempts?.length || 0}/${evaluator?.total || 10}`;
+      document.getElementById('elapsed').textContent = evaluator ? `${Number(evaluator.elapsed_s || 0).toFixed(1)} s` : '-';
+      document.getElementById('start').disabled = active;
+      document.getElementById('stop').disabled = !active;
+      renderSequence(active ? Number(evaluator.index || 0) : -1, evaluator?.attempts || []);
+      renderResults(evaluator);
+    }
+
+    async function refresh() {
+      const response = await fetch('/api/evaluator', { cache: 'no-store' });
+      update(await response.json());
+    }
+
+    async function start() {
+      const response = await fetch('/api/evaluator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload()),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('message').textContent = result.error || 'Could not start evaluator.';
+        return;
+      }
+      await refresh();
+    }
+
+    async function stop() {
+      await fetch('/api/evaluator', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+      await refresh();
+    }
+
+    document.getElementById('start').addEventListener('click', start);
+    document.getElementById('stop').addEventListener('click', stop);
+    refresh();
+    setInterval(refresh, 1000);
   </script>
 </body>
 </html>
@@ -5809,6 +6564,9 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/annotate":
                 self._send_bytes(ANNOTATION_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 return
+            if parsed.path == "/evaluate":
+                self._send_bytes(EVALUATOR_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
             if parsed.path == "/api/state":
                 self._send_bytes(json_bytes(app.state_json()), "application/json")
                 return
@@ -5820,6 +6578,9 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/api/model_rollouts":
                 self._send_bytes(json_bytes(app.list_model_rollouts()), "application/json")
+                return
+            if parsed.path == "/api/evaluator":
+                self._send_bytes(json_bytes(app.evaluator_json()), "application/json")
                 return
             if parsed.path == "/api/synthetic_recordings":
                 self._send_bytes(json_bytes(app.list_synthetic_recordings()), "application/json")
@@ -6001,6 +6762,7 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                 "/api/recordings",
                 "/api/model_run",
                 "/api/model_rollouts",
+                "/api/evaluator",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -6070,6 +6832,14 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                         result = app.stop_model_run()
                     else:
                         raise ValueError("Model action must be 'start' or 'stop'.")
+                elif parsed.path == "/api/evaluator":
+                    action = payload.get("action")
+                    if action == "start":
+                        result = app.start_evaluator(payload)
+                    elif action == "stop":
+                        result = app.stop_evaluator()
+                    else:
+                        raise ValueError("Evaluator action must be 'start' or 'stop'.")
                 else:
                     result = app.save_annotation(payload)
             except Exception as exc:

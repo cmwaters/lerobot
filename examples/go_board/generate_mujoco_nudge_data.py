@@ -40,8 +40,8 @@ from mujoco_board_sim import (
 
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 DEFAULT_OUTPUT_DIR = Path("outputs/go_board_mujoco_nudge_recordings")
-ROBOTSTUDIO_BASE_POS = np.array([0.335, 0.0, 0.012], dtype=np.float64)
-ROBOTSTUDIO_BASE_QUAT_180_Z = "0 0 0 1"
+ROBOTSTUDIO_BASE_POS = np.array([-0.335, 0.030, 0.012], dtype=np.float64)
+ROBOTSTUDIO_BASE_QUAT_180_Z = "1 0 0 0"
 ROBOTSTUDIO_BLUE_RGBA = "0.05 0.20 0.85 1"
 WRIST_CAMERA_POS = "0 -0.050 -0.060"
 WRIST_CAMERA_XYAXES = "-1 0 0 0 -0.766044 -0.642788"
@@ -51,6 +51,31 @@ NUDGE_TIP_RADIUS_M = 0.0045
 NUDGE_TIP_POS = "-0.0079 -0.000218121 -0.0981274"
 OVERHEAD_CAMERA_Z_M = 0.74
 OVERHEAD_CAMERA_FOVY_DEG = 45.0
+REAL_CENTER_TOUCH_JOINTS = {
+    "shoulder_pan": 6.95,
+    "shoulder_lift": -10.59,
+    "elbow_flex": 56.66,
+    "wrist_flex": 11.91,
+    "wrist_roll": -9.27,
+    "gripper": 1.52,
+}
+SIM_CENTER_TOUCH_QPOS = {
+    "shoulder_pan": 0.096,
+    "shoulder_lift": 0.279,
+    "elbow_flex": 0.406,
+    "wrist_flex": 0.232,
+    "wrist_roll": 1.7,
+    "gripper": -0.145,
+}
+SIM_CENTER_TOUCH_DEG = {
+    name: math.degrees(value)
+    for name, value in SIM_CENTER_TOUCH_QPOS.items()
+    if name != "gripper"
+}
+REAL_TO_SIM_DEG_OFFSET = {
+    name: SIM_CENTER_TOUCH_DEG[name] - REAL_CENTER_TOUCH_JOINTS[name]
+    for name in SIM_CENTER_TOUCH_DEG
+}
 
 
 @dataclass(frozen=True)
@@ -409,6 +434,8 @@ def build_nudge_scene_xml(
     grid_z = top_z + 0.0008
     stone_z = top_z + spec.stone_half_height_m + 0.0004
     initial_xy = np.array(scenario.target_xy) + np.array(scenario.initial_offset_xy)
+    bowl_y = half + 0.052
+    bowl_z = 0.012
 
     grid_geoms: list[str] = []
     line_half = spec.grid_span_m / 2
@@ -467,18 +494,17 @@ def build_nudge_scene_xml(
     <rgba haze="0.85 0.88 0.92 1"/>
   </visual>
   <asset>
-    <texture name="wood_tex" type="2d" builtin="checker"
-             rgb1="0.76 0.52 0.25" rgb2="0.68 0.43 0.18"
-             width="256" height="256" mark="edge" markrgb="0.25 0.14 0.05"/>
-    <material name="board_mat" texture="wood_tex" texrepeat="2 2"
+    <material name="board_mat" rgba="0.74 0.48 0.20 1"
               specular="0.18" shininess="0.35"/>
   </asset>
   <worldbody>
     <light name="overhead_light" pos="0 -0.25 0.8" diffuse="0.9 0.86 0.78"/>
     <camera name="overhead" pos="0 0 {OVERHEAD_CAMERA_Z_M:.5f}" xyaxes="1 0 0 0 1 0" fovy="{OVERHEAD_CAMERA_FOVY_DEG:.5f}"/>
     {pusher_xml}
-    {_geom("table", "box", f"{half + 0.08:.5f} {half + 0.08:.5f} 0.01000", "0 0 -0.01000", "0.35 0.32 0.28 1", friction=spec.board_friction)}
+    {_geom("table", "box", f"{half + 0.09:.5f} {half + 0.12:.5f} 0.01000", "0 0 -0.01000", "0.35 0.32 0.28 1", friction=spec.board_friction)}
     {_geom("board", "box", f"{half:.5f} {half:.5f} {spec.thickness_m / 2:.5f}", "0 0 0", "0.74 0.48 0.20 1", material="board_mat", friction=spec.board_friction)}
+    {_geom("white_bowl", "cylinder", "0.04200 0.01200", f"-0.05800 {bowl_y:.5f} {bowl_z:.5f}", "0.82 0.82 0.78 0.45", friction=spec.board_friction)}
+    {_geom("black_bowl", "cylinder", "0.04200 0.01200", f"0.05800 {bowl_y:.5f} {bowl_z:.5f}", "0.12 0.12 0.12 0.45", friction=spec.board_friction)}
     {" ".join(grid_geoms)}
     {" ".join(stone_bodies)}
   </worldbody>
@@ -606,7 +632,7 @@ class NudgeMuJoCo:
         shoulder_z = base[2] + 0.024 + 0.036
         dx = float(xy[0] - base[0])
         dy = float(xy[1] - base[1])
-        pan = math.atan2(dy, -dx) if self.robot_arm else math.atan2(dy, dx)
+        pan = math.atan2(dy, dx)
         reach = math.hypot(dx, dy)
         height = float(z - shoulder_z)
         l1 = self.arm_spec.upper_arm_m
@@ -661,14 +687,25 @@ class NudgeMuJoCo:
 
     def _joint_degrees_to_qpos(self, name: str, value: float) -> float:
         actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        qpos = math.radians(value)
+        sim_value = value
+        if self.robot_arm and name in REAL_TO_SIM_DEG_OFFSET:
+            sim_value = value + REAL_TO_SIM_DEG_OFFSET[name]
+        qpos = math.radians(sim_value)
         if actuator_id >= 0:
             low, high = self.model.actuator_ctrlrange[actuator_id]
             qpos = float(np.clip(qpos, low, high))
         return qpos
 
+    def _joint_qpos_to_real_degrees(self, name: str, qpos: float) -> float:
+        degrees = math.degrees(float(qpos))
+        if self.robot_arm and name in REAL_TO_SIM_DEG_OFFSET:
+            degrees -= REAL_TO_SIM_DEG_OFFSET[name]
+        return degrees
+
     def _gripper_percent_to_qpos(self, value: float) -> float:
         if self.robot_arm:
+            if abs(value - REAL_CENTER_TOUCH_JOINTS["gripper"]) < 1e-6:
+                return float(SIM_CENTER_TOUCH_QPOS["gripper"])
             actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
             low, high = self.model.actuator_ctrlrange[actuator_id]
             return float(low + np.clip(value, 0.0, 100.0) / 100.0 * (high - low))
@@ -682,7 +719,7 @@ class NudgeMuJoCo:
             if joint_id < 0:
                 values[name] = 0.0
                 continue
-            values[name] = math.degrees(float(target.qpos[self.model.jnt_qposadr[joint_id]]))
+            values[name] = self._joint_qpos_to_real_degrees(name, float(target.qpos[self.model.jnt_qposadr[joint_id]]))
         gripper_joint = self.mujoco.mj_name2id(
             self.model,
             self.mujoco.mjtObj.mjOBJ_JOINT,
@@ -693,6 +730,9 @@ class NudgeMuJoCo:
         else:
             qpos = float(target.qpos[self.model.jnt_qposadr[gripper_joint]])
             if self.robot_arm:
+                if abs(qpos - float(SIM_CENTER_TOUCH_QPOS["gripper"])) < 1e-4:
+                    values["gripper"] = float(REAL_CENTER_TOUCH_JOINTS["gripper"])
+                    return values
                 actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
                 low, high = self.model.actuator_ctrlrange[actuator_id]
                 values["gripper"] = float(np.clip((qpos - low) / (high - low) * 100.0, 0.0, 100.0))
@@ -937,9 +977,9 @@ def _scenario(rng: random.Random, episode_index: int, spec: BoardSpec, target_co
 def _ik_calibration_scenario(spec: BoardSpec) -> Scenario:
     row, col, coord = parse_go_coord("K10", spec.size)
     target_xy = np.array(intersection_xy(row, col, spec), dtype=np.float64)
-    offset = np.array([0.014, -0.006], dtype=np.float64)
+    offset = np.array([0.0, 0.0], dtype=np.float64)
     return Scenario(
-        episode_id="ik_calibration_white_to_k10",
+        episode_id="center_touch_calibration_white_to_k10",
         target_coord=coord,
         target_row=row,
         target_col=col,
@@ -1297,47 +1337,55 @@ def generate_dataset(output_root: Path, cfg: NudgeConfig, targets: list[str], fo
     return summary
 
 
-def _place_arm_pre_touch(sim: NudgeMuJoCo) -> dict[str, Any]:
+def _parse_joint_values(value: str) -> dict[str, float]:
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("--viewer-real-joints must be a JSON object.") from exc
+    if not isinstance(raw, dict):
+        raise argparse.ArgumentTypeError("--viewer-real-joints must be a JSON object.")
+    missing = [name for name in JOINT_NAMES if name not in raw]
+    if missing:
+        raise argparse.ArgumentTypeError(f"--viewer-real-joints is missing: {', '.join(missing)}.")
+    try:
+        return {name: float(raw[name]) for name in JOINT_NAMES}
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("--viewer-real-joints values must be numbers.") from exc
+
+
+def _place_arm_pre_touch(sim: NudgeMuJoCo, real_joints: dict[str, float] | None = None) -> dict[str, Any]:
     if not sim.robot_arm:
         raise ValueError("IK calibration requires --robot-arm.")
+    source_joints = real_joints or REAL_CENTER_TOUCH_JOINTS
     stone_xy = sim.stone_xy()
-    to_target = sim.target_xy - stone_xy
-    direction_norm = float(np.linalg.norm(to_target))
-    if direction_norm < 1e-9:
-        direction = np.array([1.0, 0.0], dtype=np.float64)
-    else:
-        direction = to_target / direction_norm
-    gap_m = 0.003
-    pre_touch_xy = stone_xy - direction * (sim.spec.stone_radius_m + sim.nudge_tip_radius_m + gap_m)
-    target_xyz = np.array([pre_touch_xy[0], pre_touch_xy[1], sim.stone_z], dtype=np.float64)
-
-    # Start from a neutral pose and solve the real MuJoCo nudge-tip position.
-    for name in JOINT_NAMES[:-1]:
-        joint_id = sim.mujoco.mj_name2id(sim.model, sim.mujoco.mjtObj.mjOBJ_JOINT, name)
-        sim.data.qpos[sim.model.jnt_qposadr[joint_id]] = 0.0
-    gripper_joint = sim.mujoco.mj_name2id(sim.model, sim.mujoco.mjtObj.mjOBJ_JOINT, "gripper")
-    gripper_actuator = sim.mujoco.mj_name2id(sim.model, sim.mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
-    gripper_low, gripper_high = sim.model.actuator_ctrlrange[gripper_actuator]
-    gripper_qpos = float(gripper_low + 0.35 * (gripper_high - gripper_low))
-    sim.data.qpos[sim.model.jnt_qposadr[gripper_joint]] = gripper_qpos
-    result = sim.solve_site_ik(target_xyz, sim.data)
-    joints = sim.current_arm_joint_targets()
+    sim.set_arm_joint_targets(source_joints)
     sim.mujoco.mj_forward(sim.model, sim.data)
+    site_id = sim.mujoco.mj_name2id(sim.model, sim.mujoco.mjtObj.mjOBJ_SITE, "nudge_tip")
+    actual_xyz = sim.data.site_xpos[site_id].copy()
+    target_xyz = np.array([sim.target_xy[0], sim.target_xy[1], sim.stone_z], dtype=np.float64)
+    joints = sim.current_arm_joint_targets()
     return {
         "stone_xy_m": stone_xy.round(6).tolist(),
         "target_xy_m": sim.target_xy.round(6).tolist(),
-        "pre_touch_xy_m": pre_touch_xy.round(6).tolist(),
-        "nudge_tip_xyz_m": result["actual_xyz_m"],
+        "pre_touch_xy_m": sim.target_xy.round(6).tolist(),
+        "nudge_tip_xyz_m": actual_xyz.round(6).tolist(),
         "target_nudge_tip_xyz_m": target_xyz.round(6).tolist(),
         "nudge_tip_radius_m": sim.nudge_tip_radius_m,
-        "gap_m": gap_m,
-        "ik_error_m": result["ik_error_m"],
-        "ik_iterations": result["ik_iterations"],
+        "gap_m": 0.0,
+        "ik_error_m": float(np.linalg.norm(actual_xyz - target_xyz)),
+        "ik_iterations": 0,
+        "source_joints": source_joints,
         "joints": {name: round(value, 3) for name, value in joints.items()},
     }
 
 
-def run_viewer(cfg: NudgeConfig, targets: list[str], episode_index: int, ik_calibration: bool = False) -> None:
+def run_viewer(
+    cfg: NudgeConfig,
+    targets: list[str],
+    episode_index: int,
+    ik_calibration: bool = False,
+    real_joints: dict[str, float] | None = None,
+) -> None:
     try:
         import mujoco.viewer
     except ImportError as exc:
@@ -1372,7 +1420,7 @@ def run_viewer(cfg: NudgeConfig, targets: list[str], episode_index: int, ik_cali
     )
     pre_touch: dict[str, Any] | None = None
     if ik_calibration:
-        pre_touch = _place_arm_pre_touch(sim)
+        pre_touch = _place_arm_pre_touch(sim, real_joints=real_joints)
     print(
         f"Viewer nudge demo: {scenario.episode_id}, target={scenario.target_color} "
         f"{scenario.target_coord}, neighbors={len(scenario.neighbor_stones)}, robot_arm={cfg.robot_arm}."
@@ -1437,6 +1485,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--viewer-ik-calibration",
         action="store_true",
         help="Open a simple one-white-stone scene with the arm posed just before contact for IK calibration.",
+    )
+    parser.add_argument(
+        "--viewer-real-joints",
+        type=_parse_joint_values,
+        help=(
+            "JSON object of real/dashboard joint values to apply in viewer calibration mode. "
+            "Must include shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, and gripper."
+        ),
     )
     parser.add_argument(
         "--wrist-camera-pos",
@@ -1518,7 +1574,13 @@ def main() -> None:
     )
     targets = args.target or default_targets()
     if args.viewer:
-        run_viewer(cfg, targets, args.viewer_episode_index, ik_calibration=args.viewer_ik_calibration)
+        run_viewer(
+            cfg,
+            targets,
+            args.viewer_episode_index,
+            ik_calibration=args.viewer_ik_calibration,
+            real_joints=args.viewer_real_joints,
+        )
         return
     summary = generate_dataset(args.output_dir, cfg, targets, force=args.force)
     print(json.dumps(summary, indent=2))
