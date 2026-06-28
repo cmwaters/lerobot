@@ -1637,10 +1637,37 @@ class DashboardApp:
                 "message": self.evaluator_message,
                 "defaults": {
                     **asdict(self.model),
+                    "policy_paths": self._known_policy_paths(),
                     "commands": DEFAULT_EVALUATION_SEQUENCE,
                     "duration_s": 30,
                 },
             }
+
+    def _known_policy_paths(self) -> list[dict[str, Any]]:
+        repo_root = Path(__file__).resolve().parents[2]
+        train_root = repo_root / "outputs" / "train"
+        if not train_root.is_dir():
+            return []
+        paths: list[dict[str, Any]] = []
+        for path in train_root.glob("**/pretrained_model"):
+            if not path.is_dir():
+                continue
+            try:
+                relative = path.relative_to(repo_root)
+            except ValueError:
+                relative = path
+            checkpoint = path.parent.name
+            run_name = path.parent.parent.name if path.parent.parent != train_root else path.parent.name
+            paths.append(
+                {
+                    "path": str(relative),
+                    "label": f"{run_name} / {checkpoint}",
+                    "run": run_name,
+                    "checkpoint": checkpoint,
+                    "updated_at": path.stat().st_mtime,
+                }
+            )
+        return sorted(paths, key=lambda item: (float(item["updated_at"]), item["path"]), reverse=True)
 
     def _parse_evaluator_commands(self, raw_commands: Any) -> list[dict[str, str]]:
         commands = raw_commands if isinstance(raw_commands, list) and raw_commands else DEFAULT_EVALUATION_SEQUENCE
@@ -5112,7 +5139,7 @@ EVALUATOR_HTML = r"""<!doctype html>
       <div class="form">
         <div class="grid">
           <label class="wide">Policy Path
-            <input id="policy-path" autocomplete="off" />
+            <select id="policy-path"></select>
           </label>
           <label class="wide">Remote Policy Server
             <input id="remote-policy-server" autocomplete="off" placeholder="desktop:8080" />
@@ -5211,6 +5238,33 @@ EVALUATOR_HTML = r"""<!doctype html>
       };
     }
 
+    function populatePolicyPaths(defaults) {
+      const select = document.getElementById('policy-path');
+      const paths = defaults.policy_paths || [];
+      select.innerHTML = '';
+      for (const item of paths) {
+        const option = document.createElement('option');
+        option.value = item.path;
+        option.textContent = item.label || item.path;
+        select.appendChild(option);
+      }
+      const configured = defaults.policy_path || '';
+      if (configured && !paths.some(item => item.path === configured)) {
+        const option = document.createElement('option');
+        option.value = configured;
+        option.textContent = configured;
+        select.appendChild(option);
+      }
+      if (select.options.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No outputs/train models found';
+        select.appendChild(option);
+      }
+      if (configured) select.value = configured;
+      if (!select.value && select.options.length > 0) select.selectedIndex = 0;
+    }
+
     function renderSequence(activeIndex, attempts) {
       const root = document.getElementById('sequence');
       const byIndex = new Map((attempts || []).map(item => [Number(item.index), item]));
@@ -5256,7 +5310,7 @@ EVALUATOR_HTML = r"""<!doctype html>
       const defaults = data.defaults || {};
       if (!defaultsLoaded) {
         commands = defaults.commands || [];
-        document.getElementById('policy-path').value = defaults.policy_path || '';
+        populatePolicyPaths(defaults);
         document.getElementById('remote-policy-server').value = defaults.remote_policy_server || '';
         document.getElementById('policy-type').value = defaults.policy_type || 'act';
         document.getElementById('actions-per-chunk').value = defaults.actions_per_chunk || 20;
