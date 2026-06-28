@@ -1657,7 +1657,11 @@ class DashboardApp:
             except ValueError:
                 relative = path
             checkpoint = path.parent.name
-            run_name = path.parent.parent.name if path.parent.parent != train_root else path.parent.name
+            run_name = (
+                path.parent.parent.parent.name
+                if path.parent.parent.name == "checkpoints"
+                else path.parent.parent.name
+            )
             paths.append(
                 {
                     "path": str(relative),
