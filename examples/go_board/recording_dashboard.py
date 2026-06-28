@@ -1383,6 +1383,7 @@ class DashboardApp:
         if run is not None:
             started_at = run.started_at
             target = self._target_metadata(run.coord, run.color)
+            model_metrics = self._load_model_metrics(rollout_dir)
             model_meta = {
                 "id": run.id,
                 "coord": run.coord,
@@ -1402,6 +1403,7 @@ class DashboardApp:
                 "returncode": run.returncode,
                 "error": run.error,
                 "log_tail": run.log_tail[-80:],
+                "metrics": model_metrics,
             }
             if run.evaluation_id:
                 model_meta["evaluation_id"] = run.evaluation_id
@@ -1444,6 +1446,28 @@ class DashboardApp:
                 "stop_on_done": run.stop_on_done,
             }
         return metadata
+
+    @staticmethod
+    def _load_model_metrics(rollout_dir: Path) -> dict[str, Any] | None:
+        metrics_path = rollout_dir / "model_metrics.json"
+        if not metrics_path.is_file():
+            return None
+        try:
+            data = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        call_count = data.get("model_call_count")
+        avg_latency = data.get("avg_model_latency_s")
+        if not isinstance(call_count, int):
+            return None
+        return {
+            "source": data.get("source", ""),
+            "model_call_count": call_count,
+            "avg_model_latency_s": avg_latency if isinstance(avg_latency, int | float) else None,
+            "min_model_latency_s": data.get("min_model_latency_s"),
+            "max_model_latency_s": data.get("max_model_latency_s"),
+            "total_model_latency_s": data.get("total_model_latency_s"),
+        }
 
     def _finalize_model_rollout(self, run: ModelRunSession) -> None:
         if run.rollout_dir is None or run.baseline is None:
@@ -1766,6 +1790,8 @@ class DashboardApp:
             rollout_name = rollout_path.name
         board = metadata.get("board", {})
         task_state = board.get("task_state") or self._task_state_from_delta(board.get("delta"), board.get("target"))
+        model_run = metadata.get("model_run") if isinstance(metadata.get("model_run"), dict) else {}
+        model_metrics = model_run.get("metrics") if isinstance(model_run.get("metrics"), dict) else None
         timed_out = bool(run is not None and run.returncode == 0 and not task_state.get("done") and run.duration_s >= 30)
         attempt = {
             "index": index,
@@ -1778,6 +1804,8 @@ class DashboardApp:
             "rollout": rollout_name,
             "returncode": None if run is None else run.returncode,
             "rest": rest_result,
+            "model_call_count": None if model_metrics is None else model_metrics.get("model_call_count"),
+            "avg_model_latency_s": None if model_metrics is None else model_metrics.get("avg_model_latency_s"),
         }
         if rollout_path is not None and metadata:
             metadata["evaluation_attempt"] = attempt
@@ -5207,6 +5235,8 @@ EVALUATOR_HTML = r"""<!doctype html>
               <th>#</th>
               <th>Move</th>
               <th>Status</th>
+              <th>Calls</th>
+              <th>Avg Latency</th>
               <th>Reason</th>
               <th>Rollout</th>
             </tr>
@@ -5293,10 +5323,14 @@ EVALUATOR_HTML = r"""<!doctype html>
       for (const attempt of attempts) {
         const tr = document.createElement('tr');
         const status = attempt.success ? 'ok' : attempt.timed_out ? 'warn' : 'bad';
+        const avgLatency = Number(attempt.avg_model_latency_s);
+        const latencyText = Number.isFinite(avgLatency) ? `${(avgLatency * 1000).toFixed(1)} ms` : '-';
         tr.innerHTML = `
           <td>${Number(attempt.index) + 1}</td>
           <td>${escapeHtml(attempt.color)} to ${escapeHtml(attempt.coord)}</td>
           <td><span class="badge ${status}">${attempt.success ? 'succeeded' : attempt.timed_out ? 'timed out' : 'failed'}</span></td>
+          <td>${attempt.model_call_count ?? '-'}</td>
+          <td>${latencyText}</td>
           <td>${escapeHtml(attempt.reason || '')}</td>
           <td>${escapeHtml(attempt.rollout || '')}</td>
         `;
@@ -5304,7 +5338,7 @@ EVALUATOR_HTML = r"""<!doctype html>
       }
       if (attempts.length === 0) {
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td colspan="5">No attempts yet.</td>';
+        tr.innerHTML = '<td colspan="7">No attempts yet.</td>';
         tbody.appendChild(tr);
       }
     }

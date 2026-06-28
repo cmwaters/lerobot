@@ -125,6 +125,36 @@ class ActionTraceRecorder:
             file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+class ModelMetricsRecorder:
+    def __init__(self, path: Path | None, *, source: str) -> None:
+        self.path = path
+        self.source = source
+        self.latencies_s: list[float] = []
+        self.started_at = time.time()
+
+    def record_call(self, latency_s: float) -> None:
+        self.latencies_s.append(float(latency_s))
+
+    def write(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        call_count = len(self.latencies_s)
+        total_s = sum(self.latencies_s)
+        payload = {
+            "schema_version": 1,
+            "source": self.source,
+            "started_at": self.started_at,
+            "ended_at": time.time(),
+            "model_call_count": call_count,
+            "avg_model_latency_s": (total_s / call_count) if call_count else None,
+            "min_model_latency_s": min(self.latencies_s) if call_count else None,
+            "max_model_latency_s": max(self.latencies_s) if call_count else None,
+            "total_model_latency_s": total_s,
+        }
+        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
@@ -423,12 +453,14 @@ class TimedBaseStrategy(BaseStrategy):
         action_trace: ActionTraceRecorder | None = None,
         gripper_guard: GripperCommandGuard | None = None,
         done_check: Any | None = None,
+        model_metrics: ModelMetricsRecorder | None = None,
     ) -> None:
         super().__init__(config)
         self.warn_threshold_s = warn_threshold_s
         self.action_trace = action_trace or ActionTraceRecorder(None)
         self.gripper_guard = gripper_guard or GripperCommandGuard()
         self.done_check = done_check
+        self.model_metrics = model_metrics or ModelMetricsRecorder(None, source="local")
 
     def _timed_send_next_action(
         self,
@@ -451,6 +483,7 @@ class TimedBaseStrategy(BaseStrategy):
             stage_start = time.perf_counter()
             action_tensor = engine.get_action(obs_frame)
             timings["policy_get_action"] = time.perf_counter() - stage_start
+            self.model_metrics.record_call(timings["policy_get_action"])
             if action_tensor is not None:
                 stage_start = time.perf_counter()
                 interpolator.add(action_tensor.cpu())
@@ -501,44 +534,47 @@ class TimedBaseStrategy(BaseStrategy):
         engine.resume()
         logger.info("Base strategy control loop started with Go timing instrumentation")
 
-        while not ctx.runtime.shutdown_event.is_set():
-            tick += 1
-            loop_start = time.perf_counter()
-            timings: dict[str, float] = {}
+        try:
+            while not ctx.runtime.shutdown_event.is_set():
+                tick += 1
+                loop_start = time.perf_counter()
+                timings: dict[str, float] = {}
 
-            if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
-                logger.info("Duration limit reached (%.0fs)", cfg.duration)
-                break
+                if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
+                    logger.info("Duration limit reached (%.0fs)", cfg.duration)
+                    break
 
-            stage_start = time.perf_counter()
-            obs = robot.get_observation()
-            timings["robot_get_observation"] = time.perf_counter() - stage_start
+                stage_start = time.perf_counter()
+                obs = robot.get_observation()
+                timings["robot_get_observation"] = time.perf_counter() - stage_start
 
-            stage_start = time.perf_counter()
-            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
-            timings["observation_processors"] = time.perf_counter() - stage_start
-            if self.done_check is not None and self.done_check():
-                logger.info("Target done condition reached; stopping rollout before timeout")
-                break
+                stage_start = time.perf_counter()
+                obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                timings["observation_processors"] = time.perf_counter() - stage_start
+                if self.done_check is not None and self.done_check():
+                    logger.info("Target done condition reached; stopping rollout before timeout")
+                    break
 
-            if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
-                continue
+                if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
+                    continue
 
-            action_dict, action_timings = self._timed_send_next_action(tick, obs_processed, obs, ctx, interpolator)
-            timings.update(action_timings)
+                action_dict, action_timings = self._timed_send_next_action(tick, obs_processed, obs, ctx, interpolator)
+                timings.update(action_timings)
 
-            stage_start = time.perf_counter()
-            self._log_telemetry(obs_processed, action_dict, ctx.runtime)
-            timings["telemetry_log"] = time.perf_counter() - stage_start
+                stage_start = time.perf_counter()
+                self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                timings["telemetry_log"] = time.perf_counter() - stage_start
 
-            dt = time.perf_counter() - loop_start
-            self._log_loop_timings(tick, dt, timings, cfg.fps)
-            if (sleep_t := control_interval - dt) > 0:
-                precise_sleep(sleep_t)
-            else:
-                logger.warning(
-                    f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-                )
+                dt = time.perf_counter() - loop_start
+                self._log_loop_timings(tick, dt, timings, cfg.fps)
+                if (sleep_t := control_interval - dt) > 0:
+                    precise_sleep(sleep_t)
+                else:
+                    logger.warning(
+                        f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                    )
+        finally:
+            self.model_metrics.write()
 
 
 def parse_go_coord(coord: str, board_size: int) -> tuple[int, int, str]:
@@ -666,6 +702,7 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
     action_queue: deque[torch.Tensor] = deque()
     initial_action: dict[str, float] | None = None
     action_trace = ActionTraceRecorder(_action_trace_path(args.recording_dir))
+    model_metrics = ModelMetricsRecorder(_model_metrics_path(args.recording_dir), source="remote_policy_server")
     gripper_guard = GripperCommandGuard(
         deadband=args.gripper_deadband,
         max_step=args.gripper_max_step,
@@ -769,6 +806,7 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
                 actions_start = time.perf_counter()
                 actions_response = stub.GetActions(services_pb2.Empty(), timeout=args.remote_timeout)
                 actions_time = time.perf_counter() - actions_start
+                model_metrics.record_call(actions_time)
 
                 deserialize_start = time.perf_counter()
                 timed_actions = pickle.loads(actions_response.data) if actions_response.data else []  # nosec
@@ -816,6 +854,7 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
                     retry_delay_s=args.motor_read_retry_delay,
                 )
         finally:
+            model_metrics.write()
             robot.disconnect()
             channel.close()
             logger.info("Remote policy rollout shutdown complete")
@@ -875,6 +914,12 @@ def _action_trace_path(recording_dir: Path | None) -> Path | None:
     if recording_dir is None:
         return None
     return recording_dir / "actions.jsonl"
+
+
+def _model_metrics_path(recording_dir: Path | None) -> Path | None:
+    if recording_dir is None:
+        return None
+    return recording_dir / "model_metrics.json"
 
 
 def main() -> None:
@@ -941,6 +986,7 @@ def main() -> None:
         cfg.strategy,
         warn_threshold_s=args.timing_warn_threshold,
         action_trace=ActionTraceRecorder(_action_trace_path(args.recording_dir)),
+        model_metrics=ModelMetricsRecorder(_model_metrics_path(args.recording_dir), source="local_policy"),
         gripper_guard=GripperCommandGuard(
             deadband=args.gripper_deadband,
             max_step=args.gripper_max_step,
