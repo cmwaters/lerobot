@@ -46,6 +46,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -260,8 +261,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         except Empty:  # no observation added to queue in obs_queue_timeout
             return services_pb2.Empty()
 
-        except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+        except Exception:
+            self.logger.exception("Error in GetActions")
 
             return services_pb2.Empty()
 
@@ -319,8 +320,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
+    def _prepare_action_chunk_observation(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        n_obs_steps = int(getattr(self.policy.config, "n_obs_steps", 1) or 1)
+        if n_obs_steps <= 1:
+            return observation
+
+        prepared = dict(observation)
+        image_features = set(getattr(self.policy.config, "image_features", {}) or {})
+        for key, value in observation.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+
+            if key in {OBS_STATE, OBS_ENV_STATE} and value.ndim == 2:
+                prepared[key] = value.unsqueeze(1).repeat(1, n_obs_steps, 1)
+            elif (key in image_features or key.startswith(f"{OBS_IMAGES}.")) and value.ndim == 4:
+                prepared[key] = value.unsqueeze(1).repeat(1, n_obs_steps, 1, 1, 1)
+
+        return prepared
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
+        observation = self._prepare_action_chunk_observation(observation)
         chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)

@@ -25,30 +25,76 @@ GO_COLUMNS = "ABCDEFGHJKLMNOPQRST"
 ROBOTSTUDIO_SO101_DIR = Path(__file__).resolve().parent / "assets" / "robotstudio_so101"
 ROBOTSTUDIO_SO101_XML = ROBOTSTUDIO_SO101_DIR / "so101_new_calib.xml"
 ROBOTSTUDIO_SO101_NORMALIZED_XML = Path(tempfile.gettempdir()) / "go_board_robotstudio_so101" / "so101_new_calib.xml"
+ROBOTSTUDIO_BLUE_RGBA = "0.05 0.20 0.85 1"
 
 
 @dataclass(frozen=True)
 class BoardSpec:
     size: int = 19
-    spacing_m: float = 0.022
-    margin_m: float = 0.028
-    thickness_m: float = 0.038
-    stone_radius_m: float = 0.0108
-    stone_half_height_m: float = 0.0036
+    grid_width_m: float = 0.290
+    grid_depth_m: float = 0.300
+    margin_x_m: float = 0.010
+    margin_y_m: float = 0.010
+    thickness_m: float = 0.025
+    stone_radius_m: float = 0.0070
+    stone_half_height_m: float = 0.0034
+    stone_mass_kg: float = 0.003
+    bowl_radius_m: float = 0.0525
+    bowl_half_height_m: float = 0.015
+    bowl_inner_height_m: float = 0.010
+    bowl_wall_thickness_m: float = 0.006
+    bowl_wall_segments: int = 64
+    bowl_stones_per_color: int = 60
+    bowl_center_x_offset_m: float = 0.060
+    bowl_edge_gap_m: float = 0.008
     board_friction: str = "1.2 0.02 0.001"
     stone_friction: str = "0.8 0.02 0.001"
 
     @property
+    def spacing_x_m(self) -> float:
+        return self.grid_width_m / (self.size - 1)
+
+    @property
+    def spacing_y_m(self) -> float:
+        return self.grid_depth_m / (self.size - 1)
+
+    @property
+    def spacing_m(self) -> float:
+        return (self.spacing_x_m + self.spacing_y_m) / 2
+
+    @property
+    def grid_span_x_m(self) -> float:
+        return self.grid_width_m
+
+    @property
+    def grid_span_y_m(self) -> float:
+        return self.grid_depth_m
+
+    @property
     def grid_span_m(self) -> float:
-        return (self.size - 1) * self.spacing_m
+        return max(self.grid_span_x_m, self.grid_span_y_m)
+
+    @property
+    def board_half_extent_x_m(self) -> float:
+        return self.grid_span_x_m / 2 + self.margin_x_m
+
+    @property
+    def board_half_extent_y_m(self) -> float:
+        return self.grid_span_y_m / 2 + self.margin_y_m
 
     @property
     def board_half_extent_m(self) -> float:
-        return self.grid_span_m / 2 + self.margin_m
+        return max(self.board_half_extent_x_m, self.board_half_extent_y_m)
 
     @property
     def board_top_z_m(self) -> float:
         return self.thickness_m / 2
+
+
+BASE_TO_BOARD_EDGE_GAP_M = 0.060
+ROBOTSTUDIO_BASE_FRONT_X_M = 0.06463529368429244
+DEFAULT_BOARD_CENTER_X_M = ROBOTSTUDIO_BASE_FRONT_X_M + BASE_TO_BOARD_EDGE_GAP_M + BoardSpec().board_half_extent_x_m
+DEFAULT_BOARD_CENTER_Y_M = -0.030
 
 
 @dataclass(frozen=True)
@@ -81,8 +127,8 @@ def parse_go_coord(coord: str, board_size: int = 19) -> tuple[int, int, str]:
 
 def intersection_xy(row: int, col: int, spec: BoardSpec) -> tuple[float, float]:
     center = (spec.size - 1) / 2
-    x = (col - center) * spec.spacing_m
-    y = (row - center) * spec.spacing_m
+    x = (col - center) * spec.spacing_x_m
+    y = (row - center) * spec.spacing_y_m
     return x, y
 
 
@@ -93,6 +139,8 @@ def _geom(
     pos: str,
     rgba: str,
     *,
+    euler: str | None = None,
+    quat: str | None = None,
     material: str | None = None,
     friction: str | None = None,
     contact: bool = True,
@@ -104,6 +152,10 @@ def _geom(
         "pos": pos,
         "rgba": rgba,
     }
+    if euler:
+        attrs["euler"] = euler
+    if quat:
+        attrs["quat"] = quat
     if material:
         attrs["material"] = material
     if friction:
@@ -124,7 +176,7 @@ def _stone_body(name: str, color: str, pos: tuple[float, float, float], spec: Bo
         <body name="{name}" pos="{x:.5f} {y:.5f} {z:.5f}">
           <freejoint name="{name}_free"/>
           <geom name="{name}_geom" type="ellipsoid" size="{size}" rgba="{rgba}"
-                mass="0.006" friction="{spec.stone_friction}"/>
+                mass="{spec.stone_mass_kg:.4f}" friction="{spec.stone_friction}"/>
         </body>
         """
     ).strip()
@@ -141,16 +193,93 @@ def _box(name: str, size: str, pos: str, rgba: str, *, mass: float = 0.02) -> st
     return f'<geom name="{name}" type="box" size="{size}" pos="{pos}" rgba="{rgba}" mass="{mass:.4f}"/>'
 
 
+def _bowl_xml(name: str, x: float, y: float, rgba: str, spec: BoardSpec) -> str:
+    radius = spec.bowl_radius_m
+    half_height = spec.bowl_half_height_m
+    outer_height = half_height * 2.0
+    base_height = max(0.001, outer_height - spec.bowl_inner_height_m)
+    base_half_height = base_height / 2.0
+    wall_height_half = half_height
+    wall_z = half_height
+    wall_radius = radius - spec.bowl_wall_thickness_m / 2
+    segment_angle = 2 * math.pi / spec.bowl_wall_segments
+    segment_tangent_half = radius * math.sin(segment_angle / 2) * 1.35
+    segment_radial_half = spec.bowl_wall_thickness_m / 2
+    parts = [
+        _geom(
+            f"{name}_base",
+            "cylinder",
+            f"{radius:.5f} {base_half_height:.5f}",
+            f"{x:.5f} {y:.5f} {base_half_height:.5f}",
+            rgba,
+            friction=spec.board_friction,
+        )
+    ]
+    for idx in range(spec.bowl_wall_segments):
+        theta = idx * segment_angle
+        wall_x = x + wall_radius * math.cos(theta)
+        wall_y = y + wall_radius * math.sin(theta)
+        quat = f"{math.cos(theta / 2):.8f} 0 0 {math.sin(theta / 2):.8f}"
+        parts.append(
+            _geom(
+                f"{name}_wall_{idx:02d}",
+                "box",
+                f"{segment_radial_half:.5f} {segment_tangent_half:.5f} {wall_height_half:.5f}",
+                f"{wall_x:.5f} {wall_y:.5f} {wall_z:.5f}",
+                rgba,
+                quat=quat,
+                friction=spec.board_friction,
+            )
+        )
+    return "\n".join(parts)
+
+
+def _bowl_stone_positions(x: float, y: float, spec: BoardSpec, count: int) -> list[tuple[float, float, float]]:
+    rng = random.Random()
+    inner_radius = min(
+        spec.bowl_radius_m * 0.46,
+        spec.bowl_radius_m - spec.bowl_wall_thickness_m - spec.stone_radius_m * 1.6,
+    )
+    bowl_floor_z = spec.bowl_half_height_m * 2.0 - spec.bowl_inner_height_m
+    drop_base_z = bowl_floor_z + spec.stone_half_height_m * 2.0 + 0.010
+    positions: list[tuple[float, float, float]] = []
+    for idx in range(count):
+        radius = inner_radius * math.sqrt(rng.random())
+        theta = 2 * math.pi * rng.random()
+        z = drop_base_z + (idx % 10) * (spec.stone_half_height_m * 2.4) + (idx // 10) * 0.004
+        positions.append((x + radius * math.cos(theta), y + radius * math.sin(theta), z))
+    return positions
+
+
+def _bowl_stones_xml(
+    prefix: str,
+    color: str,
+    x: float,
+    y: float,
+    spec: BoardSpec,
+    *,
+    count: int | None = None,
+    primary_name: str | None = None,
+    primary_pos: tuple[float, float, float] | None = None,
+) -> list[str]:
+    stone_count = spec.bowl_stones_per_color if count is None else count
+    positions = _bowl_stone_positions(x, y, spec, stone_count)
+    bodies: list[str] = []
+    if primary_name is not None:
+        if primary_pos is None:
+            bodies.append(_stone_body(primary_name, color, positions[0], spec))
+            positions = positions[1:]
+        else:
+            bodies.append(_stone_body(primary_name, color, primary_pos, spec))
+    for idx, pos in enumerate(positions):
+        bodies.append(_stone_body(f"{prefix}_stone_{idx:02d}", color, pos, spec))
+    return bodies
+
+
 def robotstudio_so101_xml_for_include(destination: Path | None = None) -> Path:
     """Return a MuJoCo-include-safe copy of RobotStudio's SO-101 MJCF."""
     output_path = destination or ROBOTSTUDIO_SO101_NORMALIZED_XML
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_mtime_ns = ROBOTSTUDIO_SO101_XML.stat().st_mtime_ns
-    if (
-        output_path.is_file()
-        and output_path.stat().st_mtime_ns >= source_mtime_ns
-    ):
-        return output_path
 
     tree = ElementTree.parse(ROBOTSTUDIO_SO101_XML)
     root = tree.getroot()
@@ -161,6 +290,9 @@ def robotstudio_so101_xml_for_include(destination: Path | None = None) -> Path:
             mesh.set("file", str(asset_dir / Path(mesh_file).name))
     for compiler in root.findall("compiler"):
         compiler.attrib.pop("meshdir", None)
+    for material in root.findall(".//material"):
+        if material.get("rgba") == "1 0.82 0.12 1":
+            material.set("rgba", ROBOTSTUDIO_BLUE_RGBA)
     tree.write(output_path, encoding="unicode", xml_declaration=True)
     return output_path
 
@@ -251,7 +383,7 @@ def build_scene_xml(
     white_stone_pos: tuple[float, float, float] | None = None,
     include_arm: bool = False,
     arm_spec: ArmSpec | None = None,
-    board_center_m: tuple[float, float] = (0.0, 0.0),
+    board_center_m: tuple[float, float] = (DEFAULT_BOARD_CENTER_X_M, DEFAULT_BOARD_CENTER_Y_M),
     robotstudio_include_path: Path | None = None,
 ) -> str:
     spec = spec or BoardSpec()
@@ -261,22 +393,25 @@ def build_scene_xml(
     board_x, board_y = board_center_m
     target_x += board_x
     target_y += board_y
-    half = spec.board_half_extent_m
+    half_x = spec.board_half_extent_x_m
+    half_y = spec.board_half_extent_y_m
     top_z = spec.board_top_z_m
     grid_z = top_z + 0.0008
     target_z = top_z + 0.0015
     grid_geoms: list[str] = []
 
-    line_half = spec.grid_span_m / 2
+    line_half_x = spec.grid_span_x_m / 2
+    line_half_y = spec.grid_span_y_m / 2
     line_thickness = 0.00055
     for idx in range(spec.size):
-        offset = (idx - (spec.size - 1) / 2) * spec.spacing_m
+        offset_x = (idx - (spec.size - 1) / 2) * spec.spacing_x_m
+        offset_y = (idx - (spec.size - 1) / 2) * spec.spacing_y_m
         grid_geoms.append(
             _geom(
                 f"grid_col_{idx:02d}",
                 "box",
-                f"{line_thickness:.5f} {line_half:.5f} 0.00020",
-                f"{board_x + offset:.5f} {board_y:.5f} {grid_z:.5f}",
+                f"{line_thickness:.5f} {line_half_y:.5f} 0.00020",
+                f"{board_x + offset_x:.5f} {board_y:.5f} {grid_z:.5f}",
                 "0.12 0.08 0.035 1",
                 contact=False,
             )
@@ -285,8 +420,8 @@ def build_scene_xml(
             _geom(
                 f"grid_row_{idx:02d}",
                 "box",
-                f"{line_half:.5f} {line_thickness:.5f} 0.00020",
-                f"{board_x:.5f} {board_y + offset:.5f} {grid_z:.5f}",
+                f"{line_half_x:.5f} {line_thickness:.5f} 0.00020",
+                f"{board_x:.5f} {board_y + offset_y:.5f} {grid_z:.5f}",
                 "0.12 0.08 0.035 1",
                 contact=False,
             )
@@ -328,31 +463,24 @@ def build_scene_xml(
         ),
     ]
 
-    stone_start_z = top_z + spec.stone_half_height_m * 4.0
-    bowl_y = board_y + half + 0.052
+    bowl_y = board_y + half_y + spec.bowl_edge_gap_m + spec.bowl_radius_m
+    white_bowl_x = board_x - spec.bowl_center_x_offset_m
+    black_bowl_x = board_x + spec.bowl_center_x_offset_m
     if white_stone_pos is None:
-        white_stone_pos = (board_x - 0.058, bowl_y, stone_start_z)
+        white_stone_pos = (target_x, target_y, top_z + spec.stone_half_height_m + 0.002)
     stone_bodies = [
         _stone_body("white_stone", "white", white_stone_pos, spec),
-        _stone_body("black_stone", "black", (board_x + 0.058, bowl_y, stone_start_z), spec),
+        *_bowl_stones_xml("white_bowl", "white", white_bowl_x, bowl_y, spec),
+        *_bowl_stones_xml("black_bowl", "black", black_bowl_x, bowl_y, spec),
     ]
 
-    left_bowl = _geom(
-        "white_bowl",
-        "cylinder",
-        "0.042 0.012",
-        f"{board_x - 0.058:.5f} {bowl_y:.5f} {top_z:.5f}",
-        "0.82 0.82 0.78 0.45",
-        friction=spec.board_friction,
-    )
-    right_bowl = _geom(
-        "black_bowl",
-        "cylinder",
-        "0.042 0.012",
-        f"{board_x + 0.058:.5f} {bowl_y:.5f} {top_z:.5f}",
-        "0.12 0.12 0.12 0.45",
-        friction=spec.board_friction,
-    )
+    cup_rgba = "0.86 0.84 0.76 0.72"
+    left_bowl = _bowl_xml("white_bowl", white_bowl_x, bowl_y, cup_rgba, spec)
+    right_bowl = _bowl_xml("black_bowl", black_bowl_x, bowl_y, cup_rgba, spec)
+    table_min_x = min(board_x - half_x - 0.09, -0.12)
+    table_max_x = board_x + half_x + 0.09
+    table_center_x = (table_min_x + table_max_x) / 2
+    table_half_x = (table_max_x - table_min_x) / 2
     arm_xml, equality_xml, actuator_xml = _approx_so101_xml(arm_spec) if include_arm else ("", "", "")
     include_xml = ""
     compiler_xml = '<compiler angle="radian"/>'
@@ -381,15 +509,15 @@ def build_scene_xml(
             {_geom(
                 "table",
                 "box",
-                f"{half + 0.09:.5f} {half + 0.12:.5f} 0.01000",
-                f"{board_x:.5f} {board_y:.5f} {-0.010:.5f}",
-                "0.35 0.32 0.28 1",
+                f"{table_half_x:.5f} {half_y + 0.12:.5f} 0.01000",
+                f"{table_center_x:.5f} {board_y:.5f} {-0.010:.5f}",
+                "0.88 0.85 0.76 1",
                 friction=spec.board_friction,
             )}
             {_geom(
                 "board",
                 "box",
-                f"{half:.5f} {half:.5f} {spec.thickness_m / 2:.5f}",
+                f"{half_x:.5f} {half_y:.5f} {spec.thickness_m / 2:.5f}",
                 f"{board_x:.5f} {board_y:.5f} 0",
                 "0.74 0.48 0.20 1",
                 material="board_mat",
@@ -416,7 +544,7 @@ class GoBoardMuJoCoSim:
         target_coord: str = "K10",
         spec: BoardSpec | None = None,
         arm_spec: ArmSpec | None = None,
-        board_center_m: tuple[float, float] = (0.0, 0.0),
+        board_center_m: tuple[float, float] = (DEFAULT_BOARD_CENTER_X_M, DEFAULT_BOARD_CENTER_Y_M),
         white_stone_pos: tuple[float, float, float] | None = None,
         include_arm: bool = False,
         robotstudio_arm: bool = False,
@@ -462,9 +590,10 @@ class GoBoardMuJoCoSim:
     def reset(self, seed: int | None = None, stone: str = "white_stone") -> None:
         rng = random.Random(seed)
         self.mujoco.mj_resetData(self.model, self.data)
-        half = self.spec.board_half_extent_m
-        x = self.board_center_m[0] + rng.uniform(-half * 0.25, half * 0.25)
-        y = self.board_center_m[1] + rng.uniform(-half * 0.25, half * 0.25)
+        half_x = self.spec.board_half_extent_x_m
+        half_y = self.spec.board_half_extent_y_m
+        x = self.board_center_m[0] + rng.uniform(-half_x * 0.25, half_x * 0.25)
+        y = self.board_center_m[1] + rng.uniform(-half_y * 0.25, half_y * 0.25)
         z = self.spec.board_top_z_m + self.spec.stone_half_height_m * 5.0
         self.set_stone_pose(stone, np.array([x, y, z], dtype=np.float64))
         self.mujoco.mj_forward(self.model, self.data)
@@ -661,8 +790,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include RobotStudio's SO-101 MuJoCo model from examples/go_board/assets/robotstudio_so101.",
     )
-    parser.add_argument("--board-center-x", type=float, default=0.0, help="Board center X in MuJoCo meters.")
-    parser.add_argument("--board-center-y", type=float, default=0.0, help="Board center Y in MuJoCo meters.")
+    parser.add_argument(
+        "--board-center-x",
+        type=float,
+        default=DEFAULT_BOARD_CENTER_X_M,
+        help="Board center X in MuJoCo meters.",
+    )
+    parser.add_argument(
+        "--board-center-y",
+        type=float,
+        default=DEFAULT_BOARD_CENTER_Y_M,
+        help="Board center Y in MuJoCo meters.",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--drop-height", type=float, default=0.055)
     return parser

@@ -27,10 +27,14 @@ import numpy as np
 
 from mujoco_board_sim import (
     ArmSpec,
+    BASE_TO_BOARD_EDGE_GAP_M,
     BoardSpec,
     GO_COLUMNS,
     ROBOTSTUDIO_SO101_DIR,
     ROBOTSTUDIO_SO101_XML,
+    ROBOTSTUDIO_BASE_FRONT_X_M,
+    _bowl_xml,
+    _bowl_stones_xml,
     _geom,
     _stone_body,
     intersection_xy,
@@ -40,7 +44,14 @@ from mujoco_board_sim import (
 
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 DEFAULT_OUTPUT_DIR = Path("outputs/go_board_mujoco_nudge_recordings")
-ROBOTSTUDIO_BASE_POS = np.array([-0.335, 0.030, 0.012], dtype=np.float64)
+ROBOTSTUDIO_BASE_POS = np.array(
+    [
+        -(BoardSpec().board_half_extent_x_m + BASE_TO_BOARD_EDGE_GAP_M + ROBOTSTUDIO_BASE_FRONT_X_M),
+        0.030,
+        0.012,
+    ],
+    dtype=np.float64,
+)
 ROBOTSTUDIO_BASE_QUAT_180_Z = "1 0 0 0"
 ROBOTSTUDIO_BLUE_RGBA = "0.05 0.20 0.85 1"
 WRIST_CAMERA_POS = "0 -0.050 -0.060"
@@ -51,31 +62,72 @@ NUDGE_TIP_RADIUS_M = 0.0045
 NUDGE_TIP_POS = "-0.0079 -0.000218121 -0.0981274"
 OVERHEAD_CAMERA_Z_M = 0.74
 OVERHEAD_CAMERA_FOVY_DEG = 45.0
-REAL_CENTER_TOUCH_JOINTS = {
-    "shoulder_pan": 6.95,
-    "shoulder_lift": -10.59,
-    "elbow_flex": 56.66,
-    "wrist_flex": 11.91,
-    "wrist_roll": -9.27,
-    "gripper": 1.52,
-}
-SIM_CENTER_TOUCH_QPOS = {
-    "shoulder_pan": 0.096,
-    "shoulder_lift": 0.279,
-    "elbow_flex": 0.406,
-    "wrist_flex": 0.232,
-    "wrist_roll": 1.7,
-    "gripper": -0.145,
-}
+REAL_TO_SIM_CALIBRATION_SAMPLES = [
+    {
+        "label": "rest_state_2026_06_29",
+        "real": {
+            "shoulder_pan": -90.81,
+            "shoulder_lift": -99.21,
+            "elbow_flex": 94.99,
+            "wrist_flex": 80.75,
+            "wrist_roll": -4.88,
+            "gripper": 1.01,
+        },
+        "sim_qpos": {
+            "shoulder_pan": -1.48,
+            "shoulder_lift": -1.74533,
+            "elbow_flex": 1.54,
+            "wrist_flex": 1.34,
+            "wrist_roll": 1.61,
+            "gripper": -0.127,
+        },
+    },
+]
+
+
+def _average_real_to_sim_deg_offset() -> dict[str, float]:
+    offsets: dict[str, list[float]] = {name: [] for name in JOINT_NAMES[:-1]}
+    for sample in REAL_TO_SIM_CALIBRATION_SAMPLES:
+        real = sample["real"]
+        sim_qpos = sample["sim_qpos"]
+        for name in JOINT_NAMES[:-1]:
+            offsets[name].append(math.degrees(float(sim_qpos[name])) - float(real[name]))
+    return {name: float(np.mean(values)) for name, values in offsets.items() if values}
+
+
+def _fit_real_to_sim_affine() -> dict[str, tuple[float, float]]:
+    mapping: dict[str, tuple[float, float]] = {}
+    for name in JOINT_NAMES[:-1]:
+        real_values = np.array([float(sample["real"][name]) for sample in REAL_TO_SIM_CALIBRATION_SAMPLES])
+        sim_values = np.array([float(sample["sim_qpos"][name]) for sample in REAL_TO_SIM_CALIBRATION_SAMPLES])
+        if len(real_values) == 1 or np.ptp(real_values) < 1e-9:
+            scale = math.pi / 180.0
+            intercept = float(sim_values[0] - scale * real_values[0])
+        else:
+            scale, intercept = np.polyfit(real_values, sim_values, 1)
+        mapping[name] = (float(scale), float(intercept))
+    return mapping
+
+
+def _nearest_gripper_calibration(value: float) -> tuple[float, float] | None:
+    if not REAL_TO_SIM_CALIBRATION_SAMPLES:
+        return None
+    sample = min(
+        REAL_TO_SIM_CALIBRATION_SAMPLES,
+        key=lambda item: abs(float(item["real"]["gripper"]) - value),
+    )
+    return float(sample["real"]["gripper"]), float(sample["sim_qpos"]["gripper"])
+
+
+REAL_CENTER_TOUCH_JOINTS = dict(REAL_TO_SIM_CALIBRATION_SAMPLES[0]["real"])
+SIM_CENTER_TOUCH_QPOS = dict(REAL_TO_SIM_CALIBRATION_SAMPLES[0]["sim_qpos"])
 SIM_CENTER_TOUCH_DEG = {
     name: math.degrees(value)
     for name, value in SIM_CENTER_TOUCH_QPOS.items()
     if name != "gripper"
 }
-REAL_TO_SIM_DEG_OFFSET = {
-    name: SIM_CENTER_TOUCH_DEG[name] - REAL_CENTER_TOUCH_JOINTS[name]
-    for name in SIM_CENTER_TOUCH_DEG
-}
+REAL_TO_SIM_DEG_OFFSET = _average_real_to_sim_deg_offset()
+REAL_TO_SIM_AFFINE = _fit_real_to_sim_affine()
 
 
 @dataclass(frozen=True)
@@ -429,25 +481,27 @@ def build_nudge_scene_xml(
     spec: BoardSpec,
     robotstudio_include_path: Path | None = None,
 ) -> str:
-    half = spec.board_half_extent_m
+    half_x = spec.board_half_extent_x_m
+    half_y = spec.board_half_extent_y_m
     top_z = spec.board_top_z_m
     grid_z = top_z + 0.0008
     stone_z = top_z + spec.stone_half_height_m + 0.0004
     initial_xy = np.array(scenario.target_xy) + np.array(scenario.initial_offset_xy)
-    bowl_y = half + 0.052
-    bowl_z = 0.012
+    bowl_y = half_y + spec.bowl_edge_gap_m + spec.bowl_radius_m
 
     grid_geoms: list[str] = []
-    line_half = spec.grid_span_m / 2
+    line_half_x = spec.grid_span_x_m / 2
+    line_half_y = spec.grid_span_y_m / 2
     line_thickness = 0.00055
     for idx in range(spec.size):
-        offset = (idx - (spec.size - 1) / 2) * spec.spacing_m
+        offset_x = (idx - (spec.size - 1) / 2) * spec.spacing_x_m
+        offset_y = (idx - (spec.size - 1) / 2) * spec.spacing_y_m
         grid_geoms.append(
             _geom(
                 f"grid_col_{idx:02d}",
                 "box",
-                f"{line_thickness:.5f} {line_half:.5f} 0.00020",
-                f"{offset:.5f} 0 {grid_z:.5f}",
+                f"{line_thickness:.5f} {line_half_y:.5f} 0.00020",
+                f"{offset_x:.5f} 0 {grid_z:.5f}",
                 "0.12 0.08 0.035 1",
                 contact=False,
             )
@@ -456,8 +510,8 @@ def build_nudge_scene_xml(
             _geom(
                 f"grid_row_{idx:02d}",
                 "box",
-                f"{line_half:.5f} {line_thickness:.5f} 0.00020",
-                f"0 {offset:.5f} {grid_z:.5f}",
+                f"{line_half_x:.5f} {line_thickness:.5f} 0.00020",
+                f"0 {offset_y:.5f} {grid_z:.5f}",
                 "0.12 0.08 0.035 1",
                 contact=False,
             )
@@ -469,10 +523,20 @@ def build_nudge_scene_xml(
     for idx, neighbor in enumerate(scenario.neighbor_stones):
         xy = neighbor["xy"]
         stone_bodies.append(_stone_body(_stone_name(idx), str(neighbor["color"]), (float(xy[0]), float(xy[1]), stone_z), spec))
+    stone_bodies.extend(
+        _bowl_stones_xml("white_bowl", "white", -spec.bowl_center_x_offset_m, bowl_y, spec)
+    )
+    stone_bodies.extend(
+        _bowl_stones_xml("black_bowl", "black", spec.bowl_center_x_offset_m, bowl_y, spec)
+    )
 
     include_arm = robotstudio_include_path is not None
     include_xml = f'<include file="{escape(str(robotstudio_include_path))}"/>' if robotstudio_include_path else ""
     compiler_xml = "" if include_arm else '<compiler angle="radian"/>'
+    table_min_x = min(-half_x - 0.09, float(ROBOTSTUDIO_BASE_POS[0]) - 0.12 if include_arm else -half_x - 0.09)
+    table_max_x = half_x + 0.09
+    table_center_x = (table_min_x + table_max_x) / 2
+    table_half_x = (table_max_x - table_min_x) / 2
     pusher_xml = ""
     if not include_arm:
         pusher_xml = f"""
@@ -501,10 +565,10 @@ def build_nudge_scene_xml(
     <light name="overhead_light" pos="0 -0.25 0.8" diffuse="0.9 0.86 0.78"/>
     <camera name="overhead" pos="0 0 {OVERHEAD_CAMERA_Z_M:.5f}" xyaxes="1 0 0 0 1 0" fovy="{OVERHEAD_CAMERA_FOVY_DEG:.5f}"/>
     {pusher_xml}
-    {_geom("table", "box", f"{half + 0.09:.5f} {half + 0.12:.5f} 0.01000", "0 0 -0.01000", "0.35 0.32 0.28 1", friction=spec.board_friction)}
-    {_geom("board", "box", f"{half:.5f} {half:.5f} {spec.thickness_m / 2:.5f}", "0 0 0", "0.74 0.48 0.20 1", material="board_mat", friction=spec.board_friction)}
-    {_geom("white_bowl", "cylinder", "0.04200 0.01200", f"-0.05800 {bowl_y:.5f} {bowl_z:.5f}", "0.82 0.82 0.78 0.45", friction=spec.board_friction)}
-    {_geom("black_bowl", "cylinder", "0.04200 0.01200", f"0.05800 {bowl_y:.5f} {bowl_z:.5f}", "0.12 0.12 0.12 0.45", friction=spec.board_friction)}
+    {_geom("table", "box", f"{table_half_x:.5f} {half_y + 0.12:.5f} 0.01000", f"{table_center_x:.5f} 0 -0.01000", "0.88 0.85 0.76 1", friction=spec.board_friction)}
+    {_geom("board", "box", f"{half_x:.5f} {half_y:.5f} {spec.thickness_m / 2:.5f}", "0 0 0", "0.74 0.48 0.20 1", material="board_mat", friction=spec.board_friction)}
+    {_bowl_xml("white_bowl", -spec.bowl_center_x_offset_m, bowl_y, "0.86 0.84 0.76 0.72", spec)}
+    {_bowl_xml("black_bowl", spec.bowl_center_x_offset_m, bowl_y, "0.86 0.84 0.76 0.72", spec)}
     {" ".join(grid_geoms)}
     {" ".join(stone_bodies)}
   </worldbody>
@@ -687,25 +751,30 @@ class NudgeMuJoCo:
 
     def _joint_degrees_to_qpos(self, name: str, value: float) -> float:
         actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        sim_value = value
-        if self.robot_arm and name in REAL_TO_SIM_DEG_OFFSET:
-            sim_value = value + REAL_TO_SIM_DEG_OFFSET[name]
-        qpos = math.radians(sim_value)
+        if self.robot_arm and name in REAL_TO_SIM_AFFINE:
+            scale, intercept = REAL_TO_SIM_AFFINE[name]
+            qpos = scale * value + intercept
+        else:
+            qpos = math.radians(value)
         if actuator_id >= 0:
             low, high = self.model.actuator_ctrlrange[actuator_id]
             qpos = float(np.clip(qpos, low, high))
         return qpos
 
     def _joint_qpos_to_real_degrees(self, name: str, qpos: float) -> float:
-        degrees = math.degrees(float(qpos))
-        if self.robot_arm and name in REAL_TO_SIM_DEG_OFFSET:
-            degrees -= REAL_TO_SIM_DEG_OFFSET[name]
-        return degrees
+        if self.robot_arm and name in REAL_TO_SIM_AFFINE:
+            scale, intercept = REAL_TO_SIM_AFFINE[name]
+            if abs(scale) > 1e-9:
+                return float((float(qpos) - intercept) / scale)
+        return math.degrees(float(qpos))
 
     def _gripper_percent_to_qpos(self, value: float) -> float:
         if self.robot_arm:
-            if abs(value - REAL_CENTER_TOUCH_JOINTS["gripper"]) < 1e-6:
-                return float(SIM_CENTER_TOUCH_QPOS["gripper"])
+            gripper_calibration = _nearest_gripper_calibration(value)
+            if gripper_calibration is not None:
+                real_value, sim_qpos = gripper_calibration
+                if abs(value - real_value) < 1e-6:
+                    return sim_qpos
             actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
             low, high = self.model.actuator_ctrlrange[actuator_id]
             return float(low + np.clip(value, 0.0, 100.0) / 100.0 * (high - low))
@@ -730,8 +799,13 @@ class NudgeMuJoCo:
         else:
             qpos = float(target.qpos[self.model.jnt_qposadr[gripper_joint]])
             if self.robot_arm:
-                if abs(qpos - float(SIM_CENTER_TOUCH_QPOS["gripper"])) < 1e-4:
-                    values["gripper"] = float(REAL_CENTER_TOUCH_JOINTS["gripper"])
+                matching_real_values = [
+                    float(sample["real"]["gripper"])
+                    for sample in REAL_TO_SIM_CALIBRATION_SAMPLES
+                    if abs(qpos - float(sample["sim_qpos"]["gripper"])) < 1e-4
+                ]
+                if matching_real_values:
+                    values["gripper"] = float(np.mean(matching_real_values))
                     return values
                 actuator_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper")
                 low, high = self.model.actuator_ctrlrange[actuator_id]

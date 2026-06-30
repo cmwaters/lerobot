@@ -271,13 +271,15 @@ uv run --with mujoco python examples/go_board/mujoco_board_sim.py \
   --export-xml outputs/go_board/mujoco_so101_scene.xml
 ```
 
-Use RobotStudio's SO-101 model instead of the local approximation:
+Use this as the canonical inspection scene. It contains the blue RobotStudio
+SO-101 arm, board, bowls, and stones:
 
 ```bash
 uv run --with mujoco python examples/go_board/mujoco_board_sim.py \
   --target K10 \
   --robotstudio-arm \
-  --board-center-x 0.30 \
+  --board-center-x 0.280 \
+  --board-center-y -0.030 \
   --viewer \
   --viewer-arm-demo
 ```
@@ -287,20 +289,22 @@ The RobotStudio assets live in
 `so101_new_calib.urdf`, plus RobotStudio's native MuJoCo `so101_new_calib.xml`.
 The simulator loads the native MuJoCo file because it preserves the same model
 while avoiding a URDF-to-MJCF conversion step at runtime. The generated include
-uses absolute STL mesh paths in a normalized copy so MuJoCo can find meshes when
-the Go-board scene is built from an XML string. Normal runs put that copy under
-the system temp directory; `--export-xml` writes it next to the exported scene.
+uses absolute STL mesh paths and recolors the arm blue in a normalized copy so
+MuJoCo can find meshes when the Go-board scene is built from an XML string.
+Normal runs put that copy under the system temp directory; `--export-xml` writes
+it next to the exported scene.
 
 For the first physical alignment pass, leave the RobotStudio base at MuJoCo
 origin and move the board with:
 
 ```bash
---board-center-x 0.30 --board-center-y 0.00
+--board-center-x 0.280 --board-center-y -0.030
 ```
 
-Those values are meters. The `x=0.30` default suggestion puts the board under
-the side of the RobotStudio gripper frame in the initial scene; tune it from the
-overhead camera view once the physical base-to-board offset is clearer.
+Those values are meters. With the measured board footprint, `x=0.280` puts the
+near board edge about 60 mm from the front edge of the RobotStudio SO-101 base
+mesh. The `y=-0.030` offset represents the arm sitting a few centimeters left of
+the board centerline.
 
 Run a non-GUI RobotStudio arm smoke test:
 
@@ -308,7 +312,8 @@ Run a non-GUI RobotStudio arm smoke test:
 uv run --with mujoco python examples/go_board/mujoco_board_sim.py \
   --target K10 \
   --robotstudio-arm \
-  --board-center-x 0.30 \
+  --board-center-x 0.280 \
+  --board-center-y -0.030 \
   --arm-demo
 ```
 

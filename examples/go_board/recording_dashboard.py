@@ -39,14 +39,30 @@ from detect_board_state import (
     board_state_to_jsonable,
     delta_between_board_states,
     inverse_transform_row_col,
+    normalize_corners_for_image,
     transform_board_state,
 )
 from process_overhead_recording import overhead_processed_status, process_recording_overhead
 
 
 DEFAULT_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+CONTROL_KINEMATIC_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+CONTROL_IK_MAX_ITERATIONS = 100
+CONTROL_IK_POSITION_TOLERANCE_M = 0.0015
+CONTROL_IK_WARN_TOLERANCE_M = 0.01
+CONTROL_IK_FD_STEP_DEG = 0.25
+CONTROL_IK_MAX_STEP_DEG = 5.0
+CONTROL_IK_JOINT_LIMITS = {
+    "shoulder_pan": (-110.0, 110.0),
+    "shoulder_lift": (-100.0, 100.0),
+    "elbow_flex": (-100.0, 100.0),
+    "wrist_flex": (-100.0, 100.0),
+    "wrist_roll": (-180.0, 180.0),
+}
+DEFAULT_SO101_URDF = Path("examples/go_board/assets/robotstudio_so101/so101_new_calib.urdf")
 MODEL_ROLLOUTS_DIR_NAME = "model_rollouts"
 MODEL_EVALUATIONS_DIR_NAME = "model_evaluations"
+CONTROL_RECORDINGS_DIR_NAME = "control_recordings"
 DEFAULT_SYNTHETIC_RECORDING_DIR = Path("outputs/go_board_mujoco_nudge_robot_recordings")
 DEFAULT_EVALUATION_SEQUENCE = [
     {"coord": "A1", "color": "black"},
@@ -130,6 +146,20 @@ class ModelSpec:
 
 
 @dataclass
+class ControlSpec:
+    anchors: dict[str, dict[str, Any]] = field(default_factory=dict)
+    board_lower_delta: dict[str, float] = field(default_factory=dict)
+    bowl_lower_delta: dict[str, float] = field(default_factory=dict)
+    board_lower_m: float = 0.01
+    bowl_lower_m: float = 0.01
+    gripper_open: float | None = None
+    gripper_closed: float | None = None
+    move_duration_s: float = 2.0
+    lower_duration_s: float = 1.0
+    settle_s: float = 0.25
+
+
+@dataclass
 class DashboardConfig:
     host: str = "127.0.0.1"
     port: int = 8766
@@ -138,6 +168,7 @@ class DashboardConfig:
     leader: LeaderSpec = field(default_factory=LeaderSpec)
     board: BoardSpec = field(default_factory=BoardSpec)
     model: ModelSpec = field(default_factory=ModelSpec)
+    control: ControlSpec = field(default_factory=ControlSpec)
 
 
 @dataclass
@@ -189,6 +220,7 @@ class RecordingSession:
     status: str = "starting"
     teleop_started: bool = False
     move_name: str = "recording"
+    recording_kind: str = "teleoperation"
     error: str = ""
 
 
@@ -247,6 +279,23 @@ class EvaluatorSession:
     thread: threading.Thread | None = None
 
 
+@dataclass
+class ControlRunSession:
+    id: str
+    commands: list[dict[str, str]]
+    record_each: bool
+    started_at: float
+    status: str = "starting"
+    index: int = 0
+    current_stage: str = ""
+    current_stage_index: int | None = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    message: str = ""
+    error: str = ""
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
+
+
 def parse_camera_spec(value: str) -> CameraSpec:
     """Parse camera specs like 'overhead=0' or 'wrist=/dev/video2,1280x720@30'."""
     if "=" not in value:
@@ -294,6 +343,7 @@ def load_dashboard_config(path: Path) -> DashboardConfig:
     leader_raw = raw.get("leader", {})
     board_raw = raw.get("board", {})
     model_raw = raw.get("model", {})
+    control_raw = raw.get("control", {})
     return DashboardConfig(
         host=str(raw.get("host", "127.0.0.1")),
         port=int(raw.get("port", 8766)),
@@ -346,6 +396,40 @@ def load_dashboard_config(path: Path) -> DashboardConfig:
             gripper_max_step=float(model_raw.get("gripper_max_step", 0.0)),
             release_local_devices=bool(model_raw.get("release_local_devices", True)),
         ),
+        control=ControlSpec(
+            anchors=control_raw.get("anchors", {}) if isinstance(control_raw.get("anchors", {}), dict) else {},
+            board_lower_delta={
+                str(name): float(value)
+                for name, value in (
+                    control_raw.get("board_lower_delta", {})
+                    if isinstance(control_raw.get("board_lower_delta", {}), dict)
+                    else {}
+                ).items()
+            },
+            bowl_lower_delta={
+                str(name): float(value)
+                for name, value in (
+                    control_raw.get("bowl_lower_delta", {})
+                    if isinstance(control_raw.get("bowl_lower_delta", {}), dict)
+                    else {}
+                ).items()
+            },
+            board_lower_m=float(control_raw.get("board_lower_m", 0.01)),
+            bowl_lower_m=float(control_raw.get("bowl_lower_m", 0.01)),
+            gripper_open=(
+                float(control_raw["gripper_open"])
+                if control_raw.get("gripper_open") is not None
+                else None
+            ),
+            gripper_closed=(
+                float(control_raw["gripper_closed"])
+                if control_raw.get("gripper_closed") is not None
+                else None
+            ),
+            move_duration_s=float(control_raw.get("move_duration_s", 2.0)),
+            lower_duration_s=float(control_raw.get("lower_duration_s", 1.0)),
+            settle_s=float(control_raw.get("settle_s", 0.25)),
+        ),
     )
 
 
@@ -362,14 +446,19 @@ class CameraStream:
         self.actual_height = 0
         self.frames = 0
         self.fps_started_at = time.time()
+        self.error = ""
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._stop = threading.Event()
+        self.error = ""
         self.capture = cv2.VideoCapture(self.spec.index_or_path)
         if not self.capture.isOpened():
-            raise ConnectionError(f"Could not open camera {self.spec.name} at {self.spec.index_or_path!r}.")
+            self.error = f"Could not open camera {self.spec.name} at {self.spec.index_or_path!r}."
+            self.capture.release()
+            self.capture = None
+            return
         if self.spec.fourcc:
             self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.spec.fourcc))
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.spec.width)
@@ -398,8 +487,9 @@ class CameraStream:
             self.frames = 0
             self.fps_started_at = time.time()
             self.start()
-            return {"ok": True, "name": self.spec.name}
+            return {"ok": not self.error, "name": self.spec.name, "error": self.error}
         except Exception as exc:  # pragma: no cover - hardware/runtime dependent
+            self.error = str(exc)
             return {"ok": False, "name": self.spec.name, "error": str(exc)}
 
     def _loop(self) -> None:
@@ -444,6 +534,7 @@ class CameraStream:
             "actual_width": self.actual_width,
             "actual_height": self.actual_height,
             "measured_fps": round(self.frames / max(time.time() - self.fps_started_at, 1e-6), 1),
+            "error": self.error,
         }
 
 
@@ -498,6 +589,9 @@ class TelemetrySource:
     def state(self) -> DashboardState:
         raise NotImplementedError
 
+    def move_to_joint_positions(self, goals: dict[str, float], duration_s: float) -> dict[str, Any]:
+        return {"ok": False, "error": "Telemetry source does not support joint-position moves."}
+
 
 class MockTelemetrySource(TelemetrySource):
     def __init__(self):
@@ -542,6 +636,17 @@ class MockTelemetrySource(TelemetrySource):
             end_effector=ee,
             note="Mock telemetry. Add --so101-port to read the follower arm.",
         )
+
+    def move_to_joint_positions(self, goals: dict[str, float], duration_s: float) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mock": True,
+            "goals": goals,
+            "ramp": {"steps": max(1, int(duration_s * 20)), "duration_s": round(duration_s, 2), "goals": goals},
+        }
+
+    def move_follower_to_rest(self) -> dict[str, Any]:
+        return {"ok": True, "mock": True, "goals": {}, "ramp": {"steps": 0, "duration_s": 0.0}}
 
 
 class SO101TelemetrySource(TelemetrySource):
@@ -717,6 +822,30 @@ class SO101TelemetrySource(TelemetrySource):
             self.rest_position = rest_position
             self.teleop_error = ""
         return {"ok": True, "rest_position": rest_position}
+
+    def move_to_joint_positions(self, goals: dict[str, float], duration_s: float) -> dict[str, Any]:
+        if self.robot is None:
+            return {"ok": False, "error": "Follower is not connected."}
+        filtered_goals = {
+            name: float(value)
+            for name, value in goals.items()
+            if name in self.joint_names
+        }
+        if not filtered_goals:
+            return {"ok": False, "error": "No supplied goals match follower joint names."}
+
+        try:
+            with self._lock:
+                self.teleop_enabled = False
+                self.teleop_error = "Autonomous joint move running..."
+            ramp = self._ramp_follower_to(filtered_goals, duration_s=max(0.05, float(duration_s)))
+            with self._lock:
+                self.teleop_error = ""
+            return {"ok": True, "goals": filtered_goals, "ramp": ramp}
+        except Exception as exc:  # pragma: no cover - hardware/runtime dependent
+            with self._lock:
+                self.teleop_error = f"Autonomous joint move failed: {exc}"
+            return {"ok": False, "error": str(exc)}
 
     def reconnect_leader(self) -> dict[str, Any]:
         if not self.leader_port:
@@ -940,9 +1069,11 @@ class DashboardApp:
         telemetry: TelemetrySource,
         board: BoardSpec,
         model: ModelSpec,
+        control: ControlSpec,
         annotation_dir: Path,
         config_path: Path | None = None,
         recording_dir: Path | None = None,
+        control_recording_dir: Path | None = None,
         model_rollout_dir: Path | None = None,
         model_evaluation_dir: Path | None = None,
         synthetic_recording_dir: Path | None = None,
@@ -951,8 +1082,14 @@ class DashboardApp:
         self.telemetry = telemetry
         self.board = board
         self.model = model
+        self.control = control
         self.annotation_dir = annotation_dir
         self.recording_dir = recording_dir if recording_dir is not None else annotation_dir.parent / "recordings"
+        self.control_recording_dir = (
+            control_recording_dir
+            if control_recording_dir is not None
+            else annotation_dir.parent / CONTROL_RECORDINGS_DIR_NAME
+        )
         self.model_rollout_dir = (
             model_rollout_dir if model_rollout_dir is not None else annotation_dir.parent / MODEL_ROLLOUTS_DIR_NAME
         )
@@ -980,6 +1117,12 @@ class DashboardApp:
         self.active_evaluator: EvaluatorSession | None = None
         self.last_evaluator: EvaluatorSession | None = None
         self.evaluator_message = "Ready to evaluate."
+        self.control_lock = threading.Lock()
+        self.active_control_run: ControlRunSession | None = None
+        self.last_control_run: ControlRunSession | None = None
+        self.control_message = "Ready for joint-space control."
+        self.control_kinematics: Any | None = None
+        self.control_kinematics_error = ""
         self._migrate_model_rollouts_from_recordings()
 
     def _migrate_model_rollouts_from_recordings(self) -> None:
@@ -1003,6 +1146,7 @@ class DashboardApp:
         self.telemetry.start()
 
     def stop(self) -> None:
+        self.stop_control_run()
         self.stop_evaluator()
         self.stop_model_run()
         self.telemetry.stop()
@@ -1054,6 +1198,778 @@ class DashboardApp:
         ok = all(item["ok"] for item in camera_results) and bool(telemetry_result.get("ok"))
         return {"ok": ok, "cameras": camera_results, "telemetry": telemetry_result}
 
+    def control_json(self) -> dict[str, Any]:
+        with self.control_lock:
+            active = self._control_run_status(self.active_control_run)
+            last = self._control_run_status(self.last_control_run)
+            message = self.control_message
+        return {
+            "ok": True,
+            "message": message,
+            "active": active,
+            "last": last,
+            "defaults": self._control_defaults(),
+        }
+
+    def _control_defaults(self) -> dict[str, Any]:
+        anchors = {
+            key: self._control_anchor_summary(key, value)
+            for key, value in sorted(self.control.anchors.items())
+        }
+        return {
+            "anchors": anchors,
+            "required_board_anchors": ["top_left", "top_right", "bottom_right", "bottom_left"],
+            "required_bowl_anchors": ["black_bowl", "white_bowl"],
+            "board_lower_delta": self.control.board_lower_delta,
+            "bowl_lower_delta": self.control.bowl_lower_delta,
+            "board_lower_m": self.control.board_lower_m,
+            "bowl_lower_m": self.control.bowl_lower_m,
+            "gripper_open": self.control.gripper_open,
+            "gripper_closed": self.control.gripper_closed,
+            "move_duration_s": self.control.move_duration_s,
+            "lower_duration_s": self.control.lower_duration_s,
+            "settle_s": self.control.settle_s,
+            "board_ready": self._control_board_ready(),
+            "bowls_ready": self._control_bowls_ready(),
+        }
+
+    @staticmethod
+    def _control_anchor_summary(key: str, anchor: dict[str, Any]) -> dict[str, Any]:
+        joints = anchor.get("joints") if isinstance(anchor, dict) else {}
+        source = anchor.get("source", "") if isinstance(anchor, dict) else ""
+        if source and source != "follower":
+            joints = {}
+        return {
+            "key": key,
+            "label": anchor.get("label", key) if isinstance(anchor, dict) else key,
+            "captured_at": anchor.get("captured_at") if isinstance(anchor, dict) else None,
+            "source": source,
+            "joints": joints if isinstance(joints, dict) else {},
+        }
+
+    def _control_board_ready(self) -> bool:
+        return all(self._control_anchor_joints(key) for key in ("top_left", "top_right", "bottom_right", "bottom_left"))
+
+    def _control_bowls_ready(self) -> bool:
+        return all(self._control_anchor_joints(key) for key in ("black_bowl", "white_bowl"))
+
+    def handle_control_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = str(payload.get("action") or "").strip()
+        if action == "capture_anchor":
+            return self.capture_control_anchor(str(payload.get("anchor", "")))
+        if action == "capture_gripper":
+            return self.capture_control_gripper(str(payload.get("setting", "")))
+        if action == "capture_lower_delta":
+            return self.capture_control_lower_delta(payload)
+        if action == "save_settings":
+            return self.save_control_settings(payload)
+        if action == "preview":
+            coord = self._normalize_go_coord(str(payload.get("coord", "")))
+            return {
+                "ok": True,
+                "coord": coord,
+                "pose": self._interpolated_board_pose(coord),
+                "interpolation": self._control_board_interpolation(coord),
+            }
+        if action == "move":
+            return self.move_control_target(payload)
+        if action == "start":
+            return self.start_control_run(payload)
+        if action == "stop":
+            return self.stop_control_run()
+        raise ValueError(
+            "Control action must be 'capture_anchor', 'capture_gripper', 'capture_lower_delta', "
+            "'save_settings', 'preview', 'move', 'start', or 'stop'."
+        )
+
+    def capture_control_anchor(self, anchor_key: str) -> dict[str, Any]:
+        anchor_key = self._normalize_control_anchor_key(anchor_key)
+        joints = self._current_follower_control_joints()
+        anchor = {
+            "label": anchor_key.replace("_", " ").title(),
+            "joints": joints,
+            "captured_at": time.time(),
+            "source": "follower",
+        }
+        self.control.anchors[anchor_key] = anchor
+        self._persist_control_config()
+        with self.control_lock:
+            self.control_message = f"Captured {anchor['label']} from follower joints."
+        return {"ok": True, "anchor": self._control_anchor_summary(anchor_key, anchor), "control": self.control_json()}
+
+    def capture_control_gripper(self, setting: str) -> dict[str, Any]:
+        normalized = setting.strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "open": "gripper_open",
+            "grip_open": "gripper_open",
+            "gripper_open": "gripper_open",
+            "closed": "gripper_closed",
+            "close": "gripper_closed",
+            "grip_closed": "gripper_closed",
+            "gripper_closed": "gripper_closed",
+        }
+        field_name = aliases.get(normalized)
+        if field_name is None:
+            raise ValueError("Gripper capture setting must be 'open' or 'closed'.")
+        joints = self._current_follower_control_joints()
+        if "gripper" not in joints:
+            raise ValueError("Follower telemetry does not include a gripper joint.")
+        value = float(joints["gripper"])
+        setattr(self.control, field_name, value)
+        self._persist_control_config()
+        label = "open" if field_name == "gripper_open" else "closed"
+        with self.control_lock:
+            self.control_message = f"Captured gripper {label}: {value:.2f}."
+        return {"ok": True, "setting": field_name, "value": value, "control": self.control_json()}
+
+    def capture_control_lower_delta(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target = str(payload.get("target") or "bowl").strip().lower()
+        current = self._current_follower_control_joints()
+        if target == "bowl":
+            color = str(payload.get("color") or "black").strip().lower()
+            if color not in {"black", "white"}:
+                raise ValueError("Bowl lower capture color must be 'black' or 'white'.")
+            anchor = self._control_anchor_joints(f"{color}_bowl")
+            if not anchor:
+                raise ValueError(f"Capture the {color} bowl above position before capturing its lower delta.")
+            self.control.bowl_lower_m = self._vertical_lower_distance(anchor, current)
+            self.control.bowl_lower_delta = self._delta_between_control_poses(anchor, current)
+            self._persist_control_config()
+            with self.control_lock:
+                self.control_message = f"Captured bowl lower distance {self.control.bowl_lower_m:.3f} m using {color} bowl."
+            return {
+                "ok": True,
+                "target": "bowl",
+                "lower_m": self.control.bowl_lower_m,
+                "delta": self.control.bowl_lower_delta,
+                "control": self.control_json(),
+            }
+        if target == "board":
+            coord = self._normalize_go_coord(str(payload.get("coord", "")))
+            anchor = self._interpolated_board_pose(coord)
+            self.control.board_lower_m = self._vertical_lower_distance(anchor, current)
+            self.control.board_lower_delta = self._delta_between_control_poses(anchor, current)
+            self._persist_control_config()
+            with self.control_lock:
+                self.control_message = f"Captured board lower distance {self.control.board_lower_m:.3f} m using {coord}."
+            return {
+                "ok": True,
+                "target": "board",
+                "lower_m": self.control.board_lower_m,
+                "delta": self.control.board_lower_delta,
+                "control": self.control_json(),
+            }
+        raise ValueError("Lower delta capture target must be 'bowl' or 'board'.")
+
+    def _vertical_lower_distance(self, anchor: dict[str, float], current: dict[str, float]) -> float:
+        kinematics = self._control_kinematics()
+        anchor_z = float(kinematics.forward_kinematics(self._joint_vector(anchor))[2, 3])
+        current_z = float(kinematics.forward_kinematics(self._joint_vector(current))[2, 3])
+        return round(max(0.0, anchor_z - current_z), 4)
+
+    @staticmethod
+    def _delta_between_control_poses(anchor: dict[str, float], current: dict[str, float]) -> dict[str, float]:
+        delta = {}
+        for name in CONTROL_KINEMATIC_JOINTS:
+            if name in anchor and name in current:
+                delta[name] = round(float(current[name]) - float(anchor[name]), 4)
+        return delta
+
+    @staticmethod
+    def _normalize_control_anchor_key(anchor_key: str) -> str:
+        normalized = anchor_key.strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "tl": "top_left",
+            "tr": "top_right",
+            "br": "bottom_right",
+            "bl": "bottom_left",
+            "black": "black_bowl",
+            "white": "white_bowl",
+        }
+        normalized = aliases.get(normalized, normalized)
+        valid = {"top_left", "top_right", "bottom_right", "bottom_left", "black_bowl", "white_bowl"}
+        if normalized not in valid:
+            raise ValueError(f"Unknown control anchor '{anchor_key}'.")
+        return normalized
+
+    def _current_follower_control_joints(self) -> dict[str, float]:
+        state = self.telemetry.state()
+        values = {
+            joint.name: float(joint.value)
+            for joint in state.joints
+            if joint.name in DEFAULT_JOINTS or joint.name
+        }
+        if not values:
+            raise ValueError("No follower joint telemetry is available.")
+        return values
+
+    def save_control_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "board_lower_delta" in payload:
+            self.control.board_lower_delta = self._parse_joint_delta(payload["board_lower_delta"])
+        if "bowl_lower_delta" in payload:
+            self.control.bowl_lower_delta = self._parse_joint_delta(payload["bowl_lower_delta"])
+        if "board_lower_m" in payload:
+            self.control.board_lower_m = max(0.0, float(payload.get("board_lower_m") or 0.0))
+        if "bowl_lower_m" in payload:
+            self.control.bowl_lower_m = max(0.0, float(payload.get("bowl_lower_m") or 0.0))
+        if "gripper_open" in payload:
+            self.control.gripper_open = self._optional_float(payload.get("gripper_open"))
+        if "gripper_closed" in payload:
+            self.control.gripper_closed = self._optional_float(payload.get("gripper_closed"))
+        for field_name in ("move_duration_s", "lower_duration_s", "settle_s"):
+            if field_name in payload:
+                value = float(payload[field_name])
+                if value < 0:
+                    raise ValueError(f"{field_name} must be non-negative.")
+                setattr(self.control, field_name, value)
+        self._persist_control_config()
+        with self.control_lock:
+            self.control_message = "Saved control settings."
+        return self.control_json()
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+
+    @staticmethod
+    def _parse_joint_delta(raw: Any) -> dict[str, float]:
+        if raw is None or raw == "":
+            return {}
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, dict):
+            raise ValueError("Joint delta must be a JSON object of joint name to numeric offset.")
+        return {str(name): float(value) for name, value in raw.items() if str(name).strip()}
+
+    def _persist_control_config(self) -> None:
+        if self.config_path is None:
+            return
+        raw = json.loads(self.config_path.read_text(encoding="utf-8")) if self.config_path.is_file() else {}
+        raw["control"] = {
+            "anchors": self.control.anchors,
+            "board_lower_delta": self.control.board_lower_delta,
+            "bowl_lower_delta": self.control.bowl_lower_delta,
+            "board_lower_m": self.control.board_lower_m,
+            "bowl_lower_m": self.control.bowl_lower_m,
+            "gripper_open": self.control.gripper_open,
+            "gripper_closed": self.control.gripper_closed,
+            "move_duration_s": self.control.move_duration_s,
+            "lower_duration_s": self.control.lower_duration_s,
+            "settle_s": self.control.settle_s,
+        }
+        self.config_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+    def _control_anchor_joints(self, anchor_key: str) -> dict[str, float]:
+        anchor = self.control.anchors.get(anchor_key)
+        if isinstance(anchor, dict) and anchor.get("source") not in {None, "", "follower"}:
+            return {}
+        joints = anchor.get("joints") if isinstance(anchor, dict) else None
+        if not isinstance(joints, dict) or not joints:
+            return {}
+        return {str(name): float(value) for name, value in joints.items()}
+
+    def _interpolated_board_pose(self, coord: str) -> dict[str, float]:
+        interp = self._control_board_interpolation(coord)
+        if not self._control_board_ready():
+            raise ValueError("Capture all four board corner anchors before using board interpolation.")
+        row_t = float(interp["row_t"])
+        col_t = float(interp["col_t"])
+        target_transform = self._interpolated_board_transform(row_t=row_t, col_t=col_t)
+        current_guess = self._current_or_interpolated_guess(row_t=row_t, col_t=col_t)
+        solution = self._solve_board_ik(self._joint_vector(current_guess), target_transform)
+        return self._pose_from_vector(solution, gripper=current_guess.get("gripper"))
+
+    def _control_kinematics(self) -> Any:
+        if self.control_kinematics is not None:
+            return self.control_kinematics
+
+        urdf_path = getattr(self.telemetry, "urdf_path", None) or str(DEFAULT_SO101_URDF)
+        target_frame_name = getattr(self.telemetry, "target_frame_name", "gripper_frame_link")
+        urdf = Path(str(urdf_path)).expanduser()
+        if not urdf.is_absolute():
+            urdf = Path(__file__).resolve().parents[2] / urdf
+        if not urdf.is_file():
+            raise ValueError(
+                f"Control IK needs a SO-101 URDF, but {urdf} does not exist. "
+                "Set robot.urdf_path in dashboard_config.json."
+            )
+
+        try:
+            from lerobot.model.kinematics import RobotKinematics
+
+            self.control_kinematics = RobotKinematics(
+                urdf_path=str(urdf),
+                target_frame_name=str(target_frame_name),
+                joint_names=CONTROL_KINEMATIC_JOINTS,
+            )
+            self.control_kinematics_error = ""
+            return self.control_kinematics
+        except Exception as exc:
+            self.control_kinematics_error = str(exc)
+            raise ValueError(f"Control IK unavailable: {exc}") from exc
+
+    def _interpolated_board_transform(self, row_t: float, col_t: float) -> np.ndarray:
+        transforms = {
+            "tl": self._anchor_transform("top_left"),
+            "tr": self._anchor_transform("top_right"),
+            "br": self._anchor_transform("bottom_right"),
+            "bl": self._anchor_transform("bottom_left"),
+        }
+        target = np.array(transforms["tl"], dtype=np.float64, copy=True)
+        top_xyz = transforms["tl"][:3, 3] * (1.0 - col_t) + transforms["tr"][:3, 3] * col_t
+        bottom_xyz = transforms["bl"][:3, 3] * (1.0 - col_t) + transforms["br"][:3, 3] * col_t
+        target[:3, 3] = top_xyz * (1.0 - row_t) + bottom_xyz * row_t
+        target[:3, :3] = self._nearest_anchor_transform(row_t=row_t, col_t=col_t, transforms=transforms)[:3, :3]
+        return target
+
+    def _anchor_transform(self, anchor_key: str) -> np.ndarray:
+        joints = self._control_anchor_joints(anchor_key)
+        if not joints:
+            raise ValueError(f"Capture {anchor_key.replace('_', ' ')} before using board IK.")
+        transform = self._control_kinematics().forward_kinematics(self._joint_vector(joints))
+        return np.array(transform, dtype=np.float64, copy=True)
+
+    def _solve_board_ik(self, seed: np.ndarray, target_transform: np.ndarray) -> np.ndarray:
+        kinematics = self._control_kinematics()
+        arm_joint_count = len(CONTROL_KINEMATIC_JOINTS)
+        current = np.asarray(seed[:arm_joint_count], dtype=np.float64).copy()
+        best = current.copy()
+        best_error = float("inf")
+        for _ in range(CONTROL_IK_MAX_ITERATIONS):
+            reached_xyz = self._fk_xyz(kinematics, current)
+            cartesian_error = target_transform[:3, 3] - reached_xyz
+            error = float(np.linalg.norm(cartesian_error))
+            if error < best_error:
+                best_error = error
+                best = current.copy()
+            if error <= CONTROL_IK_POSITION_TOLERANCE_M:
+                break
+            jacobian = self._position_jacobian(kinematics, current)
+            step = np.linalg.lstsq(jacobian, cartesian_error, rcond=None)[0]
+            step_norm = float(np.linalg.norm(step))
+            if step_norm > CONTROL_IK_MAX_STEP_DEG:
+                step *= CONTROL_IK_MAX_STEP_DEG / step_norm
+            current = self._clip_control_arm_joints(current + step)
+        if best_error > CONTROL_IK_WARN_TOLERANCE_M:
+            raise ValueError(
+                f"Control IK could not reach Cartesian target within {CONTROL_IK_WARN_TOLERANCE_M * 1000:.0f} mm "
+                f"(best error {best_error * 1000:.1f} mm)."
+            )
+        if len(seed) > arm_joint_count:
+            return np.concatenate([best, np.asarray(seed[arm_joint_count:], dtype=np.float64)])
+        return best
+
+    @staticmethod
+    def _fk_xyz(kinematics: Any, joints: np.ndarray) -> np.ndarray:
+        transform = kinematics.forward_kinematics(np.asarray(joints, dtype=np.float64))
+        return np.array(transform[:3, 3], dtype=np.float64, copy=True)
+
+    def _position_jacobian(self, kinematics: Any, joints: np.ndarray) -> np.ndarray:
+        jacobian = np.zeros((3, len(CONTROL_KINEMATIC_JOINTS)), dtype=np.float64)
+        for index in range(len(CONTROL_KINEMATIC_JOINTS)):
+            plus = joints.copy()
+            minus = joints.copy()
+            plus[index] += CONTROL_IK_FD_STEP_DEG
+            minus[index] -= CONTROL_IK_FD_STEP_DEG
+            jacobian[:, index] = (
+                self._fk_xyz(kinematics, plus) - self._fk_xyz(kinematics, minus)
+            ) / (2.0 * CONTROL_IK_FD_STEP_DEG)
+        return jacobian
+
+    @staticmethod
+    def _clip_control_arm_joints(joints: np.ndarray) -> np.ndarray:
+        clipped = np.asarray(joints, dtype=np.float64).copy()
+        for index, name in enumerate(CONTROL_KINEMATIC_JOINTS):
+            lower, upper = CONTROL_IK_JOINT_LIMITS.get(name, (-180.0, 180.0))
+            clipped[index] = float(np.clip(clipped[index], lower, upper))
+        return clipped
+
+    @staticmethod
+    def _nearest_anchor_transform(
+        row_t: float,
+        col_t: float,
+        transforms: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        distances = {
+            "tl": row_t * row_t + col_t * col_t,
+            "tr": row_t * row_t + (1.0 - col_t) * (1.0 - col_t),
+            "br": (1.0 - row_t) * (1.0 - row_t) + (1.0 - col_t) * (1.0 - col_t),
+            "bl": (1.0 - row_t) * (1.0 - row_t) + col_t * col_t,
+        }
+        return transforms[min(distances, key=distances.get)]
+
+    def _current_or_interpolated_guess(self, row_t: float, col_t: float) -> dict[str, float]:
+        try:
+            return self._joint_space_interpolated_pose(row_t=row_t, col_t=col_t)
+        except ValueError:
+            return self._current_follower_control_joints()
+
+    def _joint_space_interpolated_pose(self, row_t: float, col_t: float) -> dict[str, float]:
+        anchors = {
+            "tl": self._control_anchor_joints("top_left"),
+            "tr": self._control_anchor_joints("top_right"),
+            "br": self._control_anchor_joints("bottom_right"),
+            "bl": self._control_anchor_joints("bottom_left"),
+        }
+        joint_names = sorted(set.intersection(*(set(item) for item in anchors.values())))
+        if not joint_names:
+            raise ValueError("Board anchors do not share any joint names.")
+        pose = {}
+        for name in joint_names:
+            top = anchors["tl"][name] * (1.0 - col_t) + anchors["tr"][name] * col_t
+            bottom = anchors["bl"][name] * (1.0 - col_t) + anchors["br"][name] * col_t
+            pose[name] = top * (1.0 - row_t) + bottom * row_t
+        return pose
+
+    @staticmethod
+    def _joint_vector(joints: dict[str, float]) -> np.ndarray:
+        values = [float(joints.get(name, 0.0)) for name in CONTROL_KINEMATIC_JOINTS]
+        if "gripper" in joints:
+            values.append(float(joints["gripper"]))
+        return np.asarray(values, dtype=np.float64)
+
+    @staticmethod
+    def _pose_from_vector(joints: np.ndarray, gripper: float | None = None) -> dict[str, float]:
+        pose = {
+            name: float(joints[index])
+            for index, name in enumerate(CONTROL_KINEMATIC_JOINTS)
+            if index < len(joints)
+        }
+        if gripper is not None:
+            pose["gripper"] = float(gripper)
+        elif len(joints) > len(CONTROL_KINEMATIC_JOINTS):
+            pose["gripper"] = float(joints[len(CONTROL_KINEMATIC_JOINTS)])
+        return pose
+
+    def _control_board_interpolation(self, coord: str) -> dict[str, Any]:
+        coord = self._normalize_go_coord(coord)
+        columns = GO_COLUMNS if self.board.size == 19 else "".join(chr(ord("A") + i) for i in range(self.board.size))
+        row = int(coord[1:]) - 1
+        col = columns.index(coord[0])
+        return {
+            "coord": coord,
+            "row": row,
+            "col": col,
+            "row_t": row / max(1, self.board.size - 1),
+            "col_t": col / max(1, self.board.size - 1),
+            "method": (
+                "forward kinematics on the four board anchors, bilinear interpolation of target XYZ "
+                "on that Cartesian board plane, then inverse kinematics back to arm joints"
+            ),
+        }
+
+    @staticmethod
+    def _pose_with_delta(pose: dict[str, float], delta: dict[str, float]) -> dict[str, float]:
+        next_pose = dict(pose)
+        for name, offset in delta.items():
+            if name in next_pose:
+                next_pose[name] = float(next_pose[name]) + float(offset)
+        return next_pose
+
+    def _pose_lowered_cartesian(
+        self,
+        pose: dict[str, float],
+        lower_m: float,
+        fallback_delta: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        if lower_m <= 0:
+            return self._pose_with_delta(pose, fallback_delta or {})
+        seed = self._joint_vector(pose)
+        target_transform = np.array(
+            self._control_kinematics().forward_kinematics(seed),
+            dtype=np.float64,
+            copy=True,
+        )
+        target_transform[2, 3] -= float(lower_m)
+        lowered = self._solve_board_ik(seed, target_transform)
+        return self._pose_from_vector(lowered, gripper=pose.get("gripper"))
+
+    @staticmethod
+    def _pose_with_gripper(pose: dict[str, float], value: float | None) -> dict[str, float]:
+        if value is None or "gripper" not in pose:
+            return dict(pose)
+        next_pose = dict(pose)
+        next_pose["gripper"] = float(value)
+        return next_pose
+
+    def move_control_target(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target = str(payload.get("target") or "board").strip().lower()
+        duration_s = float(payload.get("duration_s") or self.control.move_duration_s)
+        if target == "rest":
+            result = self.move_follower_to_rest()
+            return {"ok": bool(result.get("ok")), "move": "rest", "result": result, "control": self.control_json()}
+        if target == "board":
+            coord = self._normalize_go_coord(str(payload.get("coord", "")))
+            pose = self._interpolated_board_pose(coord)
+            if bool(payload.get("lower", False)):
+                pose = self._pose_lowered_cartesian(
+                    pose,
+                    self.control.board_lower_m,
+                    fallback_delta=self.control.board_lower_delta,
+                )
+                duration_s = float(payload.get("duration_s") or self.control.lower_duration_s)
+            result = self._move_to_control_pose(pose, duration_s)
+            return {"ok": bool(result.get("ok")), "move": f"board {coord}", "pose": pose, "result": result}
+        if target in {"black_bowl", "white_bowl"}:
+            pose = self._control_anchor_joints(target)
+            if not pose:
+                raise ValueError(f"Capture {target.replace('_', ' ')} before moving there.")
+            if bool(payload.get("lower", False)):
+                pose = self._pose_lowered_cartesian(
+                    pose,
+                    self.control.bowl_lower_m,
+                    fallback_delta=self.control.bowl_lower_delta,
+                )
+                duration_s = float(payload.get("duration_s") or self.control.lower_duration_s)
+            result = self._move_to_control_pose(pose, duration_s)
+            return {"ok": bool(result.get("ok")), "move": target, "pose": pose, "result": result}
+        raise ValueError("Control move target must be 'rest', 'board', 'black_bowl', or 'white_bowl'.")
+
+    def _move_to_control_pose(self, pose: dict[str, float], duration_s: float) -> dict[str, Any]:
+        if not pose:
+            return {"ok": False, "error": "No joint pose was supplied."}
+        result = self.telemetry.move_to_joint_positions(pose, max(0.05, float(duration_s)))
+        if not result.get("ok"):
+            with self.control_lock:
+                self.control_message = str(result.get("error") or "Joint move failed.")
+        return result
+
+    def start_control_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.control_lock:
+            if self.active_control_run is not None:
+                raise ValueError("A control run is already active.")
+        with self.model_lock:
+            if self.active_model_run is not None:
+                raise ValueError("Stop the active model rollout before starting a control run.")
+        with self.evaluator_lock:
+            if self.active_evaluator is not None:
+                raise ValueError("Stop the evaluator before starting a control run.")
+        with self.recording_lock:
+            if self.active_recording is not None:
+                raise ValueError("Stop the active recording before starting a control run.")
+
+        commands = self._parse_control_commands(payload)
+        record_each = bool(payload.get("record_each", False))
+        run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        run = ControlRunSession(
+            id=run_id,
+            commands=commands,
+            record_each=record_each,
+            started_at=time.time(),
+            status="running",
+            message=f"Starting {len(commands)} control move{'s' if len(commands) != 1 else ''}.",
+        )
+        with self.control_lock:
+            self.active_control_run = run
+            self.last_control_run = run
+            self.control_message = run.message
+        run.thread = threading.Thread(target=self._control_run_loop, args=(run,), name=f"go-control-{run.id}", daemon=True)
+        run.thread.start()
+        return {"ok": True, "control": self.control_json()}
+
+    def stop_control_run(self) -> dict[str, Any]:
+        with self.control_lock:
+            run = self.active_control_run
+            if run is None:
+                active = False
+            else:
+                run.stop_event.set()
+                self.control_message = "Stopping control run..."
+                active = True
+        return {"ok": True, "stopping": active, "control": self.control_json()}
+
+    def _parse_control_commands(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        raw_commands = payload.get("commands")
+        if raw_commands is None:
+            raw_commands = [{"coord": payload.get("coord", ""), "color": payload.get("color", "black")}]
+        if isinstance(raw_commands, str):
+            commands = []
+            for line in raw_commands.splitlines():
+                text = line.strip()
+                if not text:
+                    continue
+                parts = text.replace(",", " ").split()
+                if len(parts) == 1:
+                    commands.append({"coord": parts[0], "color": "black"})
+                else:
+                    commands.append({"coord": parts[0], "color": parts[1]})
+            raw_commands = commands
+        if not isinstance(raw_commands, list):
+            raise ValueError("Control commands must be a list or newline-separated text.")
+        commands: list[dict[str, str]] = []
+        for raw in raw_commands:
+            if not isinstance(raw, dict):
+                raise ValueError("Each control command must be an object.")
+            coord = self._normalize_go_coord(str(raw.get("coord", "")))
+            color = str(raw.get("color", "black")).strip().lower() or "black"
+            if color not in {"black", "white"}:
+                raise ValueError("Control command color must be 'black' or 'white'.")
+            commands.append({"coord": coord, "color": color})
+        if not commands:
+            raise ValueError("At least one control command is required.")
+        return commands
+
+    def _control_run_loop(self, run: ControlRunSession) -> None:
+        try:
+            self.set_teleop_enabled(False)
+            for index, command in enumerate(run.commands):
+                if run.stop_event.is_set():
+                    run.status = "stopped"
+                    break
+                run.index = index
+                run.message = f"Running {index + 1}/{len(run.commands)}: {command['color']} to {command['coord']}."
+                with self.control_lock:
+                    self.control_message = run.message
+                recording_started = False
+                try:
+                    if run.record_each:
+                        self._start_recording_session(
+                            auto_teleop=False,
+                            recording_dir=self.control_recording_dir,
+                            recording_kind="control",
+                        )
+                        recording_started = True
+                    move_result = self._place_stone_with_control(
+                        command["coord"],
+                        command["color"],
+                        run.stop_event,
+                        run=run,
+                    )
+                    recording_result = None
+                    if recording_started:
+                        recording_result = self.stop_recording()
+                    run.attempts.append(
+                        {
+                            "index": index,
+                            "coord": command["coord"],
+                            "color": command["color"],
+                            "success": bool(move_result.get("ok")),
+                            "move": move_result,
+                            "recording": recording_result,
+                        }
+                    )
+                except Exception as exc:
+                    if recording_started:
+                        try:
+                            self.stop_recording()
+                        except Exception:
+                            pass
+                    run.attempts.append(
+                        {
+                            "index": index,
+                            "coord": command["coord"],
+                            "color": command["color"],
+                            "success": False,
+                            "error": str(exc),
+                        }
+                    )
+                    if run.stop_event.is_set():
+                        run.status = "stopped"
+                        break
+            else:
+                run.status = "complete"
+                run.current_stage = ""
+                run.current_stage_index = None
+                run.message = f"Control run complete: {self._control_success_count(run)}/{len(run.commands)} moved."
+        except Exception as exc:
+            run.status = "error"
+            run.error = str(exc)
+            run.current_stage = ""
+            run.current_stage_index = None
+            run.message = f"Control run error: {exc}"
+        finally:
+            with self.control_lock:
+                if self.active_control_run is run:
+                    self.active_control_run = None
+                self.last_control_run = run
+                self.control_message = run.message or self.control_message
+
+    def _place_stone_with_control(
+        self,
+        coord: str,
+        color: str,
+        stop_event: threading.Event | None = None,
+        run: ControlRunSession | None = None,
+    ) -> dict[str, Any]:
+        coord = self._normalize_go_coord(coord)
+        color = color.strip().lower()
+        bowl_key = f"{color}_bowl"
+        bowl_pose = self._control_anchor_joints(bowl_key)
+        if not bowl_pose:
+            raise ValueError(f"Capture {color} bowl anchor before running a {color} placement.")
+        board_pose = self._interpolated_board_pose(coord)
+        bowl_low = self._pose_lowered_cartesian(
+            bowl_pose,
+            self.control.bowl_lower_m,
+            fallback_delta=self.control.bowl_lower_delta,
+        )
+        steps = [
+            ("Moving to rest", None, self.control.move_duration_s),
+            (f"Moving above {color} bowl with open gripper", self._pose_with_gripper(bowl_pose, self.control.gripper_open), self.control.move_duration_s),
+            (f"Moving down into {color} bowl", self._pose_with_gripper(bowl_low, self.control.gripper_open), self.control.lower_duration_s),
+            (
+                f"Closing gripper on {color} stone",
+                self._pose_with_gripper(bowl_low, self.control.gripper_closed),
+                0.25,
+            ),
+            (
+                f"Moving back above {color} bowl",
+                self._pose_with_gripper(bowl_pose, self.control.gripper_closed),
+                self.control.lower_duration_s,
+            ),
+            (f"Moving across above {coord}", self._pose_with_gripper(board_pose, self.control.gripper_closed), self.control.move_duration_s),
+            (f"Opening gripper at {coord}", self._pose_with_gripper(board_pose, self.control.gripper_open), 0.25),
+            ("Returning to rest", None, self.control.move_duration_s),
+        ]
+        results = []
+        for step_index, (label, pose, duration_s) in enumerate(steps, start=1):
+            if stop_event is not None and stop_event.is_set():
+                return {"ok": False, "stopped": True, "steps": results}
+            if run is not None:
+                run.current_stage = label
+                run.current_stage_index = step_index
+                run.message = f"{label} ({step_index}/{len(steps)}) for {color} to {coord}."
+                with self.control_lock:
+                    self.control_message = run.message
+            if pose is None:
+                result = self.move_follower_to_rest()
+            else:
+                result = self._move_to_control_pose(pose, duration_s)
+            results.append({"label": label, "result": result})
+            if not result.get("ok"):
+                return {"ok": False, "failed_step": label, "steps": results, "error": result.get("error", "")}
+            if self.control.settle_s > 0:
+                time.sleep(self.control.settle_s)
+        if run is not None:
+            run.current_stage = ""
+            run.current_stage_index = None
+        return {"ok": True, "coord": coord, "color": color, "steps": results}
+
+    @staticmethod
+    def _control_success_count(run: ControlRunSession) -> int:
+        return sum(1 for attempt in run.attempts if attempt.get("success"))
+
+    def _control_run_status(self, run: ControlRunSession | None) -> dict[str, Any] | None:
+        if run is None:
+            return None
+        return {
+            "id": run.id,
+            "status": run.status,
+            "index": run.index,
+            "total": len(run.commands),
+            "elapsed_s": round(time.time() - run.started_at, 2),
+            "commands": run.commands,
+            "attempts": run.attempts,
+            "successes": self._control_success_count(run),
+            "record_each": run.record_each,
+            "current_stage": run.current_stage,
+            "current_stage_index": run.current_stage_index,
+            "message": run.message,
+            "error": run.error,
+        }
+
     def start_model_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.model_lock:
             if self.active_model_run is not None:
@@ -1077,11 +1993,11 @@ class DashboardApp:
         remote_workdir = str(
             payload.get("remote_workdir") if payload.get("remote_workdir") is not None else self.model.remote_workdir
         ).strip() or "~/Developer/lerobot"
-        remote_policy_server = str(
+        remote_policy_server = self._normalize_remote_policy_server(
             payload.get("remote_policy_server")
             if payload.get("remote_policy_server") is not None
             else self.model.remote_policy_server
-        ).strip()
+        )
         policy_type = str(payload.get("policy_type") or self.model.policy_type).strip() or "act"
         actions_per_chunk = int(payload.get("actions_per_chunk") or self.model.actions_per_chunk)
         policy_image_size = int(payload.get("policy_image_size") or self.model.policy_image_size)
@@ -1616,6 +2532,14 @@ class DashboardApp:
             if self.active_recording is not None:
                 raise ValueError("Stop the recording before starting evaluation.")
 
+        environment = self._normalize_evaluation_environment(payload.get("environment"))
+        if environment == "mujoco":
+            raise ValueError(
+                "MuJoCo simulation can be selected, but the dashboard does not have a MuJoCo policy "
+                "evaluation runner wired in yet. Use Real Life for this evaluation run."
+            )
+        payload = dict(payload)
+        payload["environment"] = environment
         commands = self._parse_evaluator_commands(payload.get("commands"))
         run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         session_dir = self._unique_recording_path(self.model_evaluation_dir / f"{run_id}_ood_eval")
@@ -1664,8 +2588,72 @@ class DashboardApp:
                     "policy_paths": self._known_policy_paths(),
                     "commands": DEFAULT_EVALUATION_SEQUENCE,
                     "duration_s": 30,
+                    "environment": "real",
                 },
             }
+
+    def list_evaluations(self) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        if not self.model_evaluation_dir.is_dir():
+            return {"evaluations": items}
+        for summary_path in sorted(self.model_evaluation_dir.glob("*/summary.json")):
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            commands = summary.get("commands") if isinstance(summary.get("commands"), list) else []
+            attempts = summary.get("attempts") if isinstance(summary.get("attempts"), list) else []
+            started_at = float(summary.get("started_at") or 0.0)
+            items.append(
+                {
+                    "id": str(summary.get("id") or summary_path.parent.name),
+                    "name": summary_path.parent.name,
+                    "path": str(summary_path.parent),
+                    "status": str(summary.get("status") or "unknown"),
+                    "started_at": started_at,
+                    "ended_at": summary.get("ended_at"),
+                    "total": len(commands),
+                    "attempts": len(attempts),
+                    "successes": int(summary.get("successes") or 0),
+                    "failures": int(summary.get("failures") or 0),
+                    "environment": self._normalize_evaluation_environment(summary.get("environment")),
+                    "message": str(summary.get("message") or summary.get("error") or ""),
+                }
+            )
+        items.sort(key=lambda item: item["started_at"], reverse=True)
+        return {"evaluations": items}
+
+    @staticmethod
+    def _normalize_evaluation_environment(raw_environment: Any) -> str:
+        environment = str(raw_environment or "real").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "hardware": "real",
+            "real_life": "real",
+            "real_world": "real",
+            "irl": "real",
+            "simulation": "mujoco",
+            "sim": "mujoco",
+            "mujoco_simulation": "mujoco",
+        }
+        environment = aliases.get(environment, environment)
+        if environment not in {"real", "mujoco"}:
+            raise ValueError("Evaluation environment must be 'real' or 'mujoco'.")
+        return environment
+
+    def _normalize_remote_policy_server(self, raw_server: Any) -> str:
+        server = str(raw_server or "").strip()
+        if not server:
+            return ""
+        parsed = urlparse(server)
+        if parsed.scheme and parsed.netloc:
+            server = parsed.netloc
+        server = server.strip().rstrip("/")
+        fallback = str(self.model.remote_policy_server or "").strip()
+        if server.endswith(":8766") and fallback and not fallback.endswith(":8766"):
+            return fallback
+        if "/" in server or server.startswith(("http:", "https:")):
+            raise ValueError("Remote Policy Server must be a gRPC host:port, for example desktop:8080.")
+        return server
 
     def _known_policy_paths(self) -> list[dict[str, Any]]:
         repo_root = Path(__file__).resolve().parents[2]
@@ -1822,6 +2810,7 @@ class DashboardApp:
             "schema_version": 1,
             "id": session.id,
             "status": session.status,
+            "environment": self._normalize_evaluation_environment(session.payload.get("environment")),
             "started_at": session.started_at,
             "ended_at": session.ended_at,
             "commands": session.commands,
@@ -1840,6 +2829,7 @@ class DashboardApp:
             "id": session.id,
             "directory": str(session.path),
             "status": session.status,
+            "environment": self._normalize_evaluation_environment(session.payload.get("environment")),
             "index": session.index,
             "total": len(session.commands),
             "elapsed_s": round(time.time() - session.started_at, 2),
@@ -1866,6 +2856,14 @@ class DashboardApp:
         return f"{columns[col]}{row}"
 
     def start_recording(self) -> dict[str, Any]:
+        return self._start_recording_session(auto_teleop=True)
+
+    def _start_recording_session(
+        self,
+        auto_teleop: bool = True,
+        recording_dir: Path | None = None,
+        recording_kind: str = "teleoperation",
+    ) -> dict[str, Any]:
         with self.model_lock:
             if self.active_model_run is not None:
                 raise ValueError("Stop the model rollout before starting a recording.")
@@ -1883,7 +2881,8 @@ class DashboardApp:
 
         started_at = time.time()
         recording_id = time.strftime("%Y%m%d_%H%M%S", time.localtime(started_at))
-        session_dir = self._unique_recording_path(self.recording_dir / f"{recording_id}_recording")
+        root_dir = recording_dir if recording_dir is not None else self.recording_dir
+        session_dir = self._unique_recording_path(root_dir / f"{recording_id}_recording")
         session_dir.mkdir(parents=True, exist_ok=False)
         (session_dir / "frames").mkdir()
         for camera_name in self.cameras:
@@ -1899,6 +2898,7 @@ class DashboardApp:
             baseline_image=baseline_image,
             sample_hz=10.0,
             status="recording",
+            recording_kind=recording_kind,
         )
         self._write_recording_metadata(session, status="recording")
 
@@ -1909,11 +2909,21 @@ class DashboardApp:
             self.board_message = f"Recording baseline captured with {baseline.summary['total']} stones."
         with self.recording_lock:
             self.active_recording = session
-            self.recording_message = "Recording started. Moving follower to leader before teleoperation."
+            self.recording_message = (
+                "Recording started. Moving follower to leader before teleoperation."
+                if auto_teleop
+                else "Control recording started."
+            )
 
         session.thread = threading.Thread(target=self._recording_loop, args=(session,), name="go-recording", daemon=True)
         session.thread.start()
-        threading.Thread(target=self._delayed_recording_teleop, args=(session,), name="go-recording-teleop", daemon=True).start()
+        if auto_teleop:
+            threading.Thread(
+                target=self._delayed_recording_teleop,
+                args=(session,),
+                name="go-recording-teleop",
+                daemon=True,
+            ).start()
         return {"ok": True, "recording": self._recording_status(session), "board": self.board_json()}
 
     def stop_recording(self) -> dict[str, Any]:
@@ -1973,32 +2983,73 @@ class DashboardApp:
         }
 
     def list_recordings(self) -> dict[str, Any]:
+        items = self._recording_summaries_from_dir(self.recording_dir, include_control=False)
+        return {
+            "ok": True,
+            "directory": str(self.recording_dir),
+            "active": (
+                None
+                if self.active_recording is None or not self._path_is_relative_to(self.active_recording.path, self.recording_dir)
+                else self._recording_status(self.active_recording)
+            ),
+            "message": self.recording_message,
+            "recordings": items,
+        }
+
+    def list_control_recordings(self) -> dict[str, Any]:
+        items = self._recording_summaries_from_dir(self.control_recording_dir, include_control=True)
+        return {
+            "ok": True,
+            "directory": str(self.control_recording_dir),
+            "active": (
+                None
+                if self.active_recording is None
+                or not self._path_is_relative_to(self.active_recording.path, self.control_recording_dir)
+                else self._recording_status(self.active_recording)
+            ),
+            "message": self.recording_message,
+            "recordings": items,
+        }
+
+    def _recording_summaries_from_dir(self, directory: Path, include_control: bool) -> list[dict[str, Any]]:
         items = []
-        if self.recording_dir.is_dir():
-            for metadata_path in sorted(self.recording_dir.glob("*/metadata.json")):
+        if directory.is_dir():
+            for metadata_path in sorted(directory.glob("*/metadata.json")):
                 try:
                     data = json.loads(metadata_path.read_text(encoding="utf-8"))
                     if data.get("run_type") == "model_inference":
                         continue
+                    is_control = data.get("recording_kind") == "control" or bool(data.get("control_run"))
+                    if is_control and not include_control:
+                        continue
                     items.append(self._recording_summary_from_metadata(metadata_path))
                 except Exception:
                     continue
-        return {
-            "ok": True,
-            "directory": str(self.recording_dir),
-            "active": None if self.active_recording is None else self._recording_status(self.active_recording),
-            "message": self.recording_message,
-            "recordings": items,
-        }
+        return items
 
     def list_model_rollouts(self) -> dict[str, Any]:
         items = []
         if self.model_rollout_dir.is_dir():
             for metadata_path in sorted(self.model_rollout_dir.glob("*/metadata.json")):
                 try:
-                    items.append(self._recording_summary_from_metadata(metadata_path))
+                    item = self._recording_summary_from_metadata(metadata_path)
+                    item["source"] = "standalone"
+                    items.append(item)
                 except Exception:
                     continue
+        if self.model_evaluation_dir.is_dir():
+            for metadata_path in sorted(self.model_evaluation_dir.glob("*/*/metadata.json")):
+                try:
+                    evaluation_id = metadata_path.parent.parent.name
+                    item = self._recording_summary_from_metadata(metadata_path)
+                    item["id"] = f"{evaluation_id}/{metadata_path.parent.name}"
+                    item["name"] = metadata_path.parent.name
+                    item["evaluation_id"] = evaluation_id
+                    item["source"] = "evaluation"
+                    items.append(item)
+                except Exception:
+                    continue
+        items.sort(key=lambda item: float(item.get("started_at") or 0.0), reverse=True)
         return {
             "ok": True,
             "directory": str(self.model_rollout_dir),
@@ -2040,6 +3091,28 @@ class DashboardApp:
             "ok": True,
             "deleted": rollout_path.name,
             "message": self.model_message,
+            "model_rollouts": self.list_model_rollouts()["model_rollouts"],
+        }
+
+    def delete_evaluation(self, evaluation_id: str) -> dict[str, Any]:
+        safe_id = Path(evaluation_id).name
+        if not safe_id:
+            raise ValueError("Evaluation id is required.")
+        evaluation_path = self.model_evaluation_dir / safe_id
+        if not evaluation_path.is_dir():
+            raise FileNotFoundError(safe_id)
+        with self.evaluator_lock:
+            if self.active_evaluator is not None and self.active_evaluator.path == evaluation_path:
+                raise ValueError("Cannot delete an evaluation while it is active.")
+            if self.last_evaluator is not None and self.last_evaluator.path == evaluation_path:
+                self.last_evaluator = None
+                self.evaluator_message = "Deleted saved evaluation."
+        shutil.rmtree(evaluation_path)
+        return {
+            "ok": True,
+            "deleted": safe_id,
+            "message": f"Deleted evaluation {safe_id}.",
+            "evaluations": self.list_evaluations()["evaluations"],
             "model_rollouts": self.list_model_rollouts()["model_rollouts"],
         }
 
@@ -2103,8 +3176,9 @@ class DashboardApp:
         if not metadata_path.is_file():
             raise FileNotFoundError(rollout_id)
         metadata = json.loads(metadata_path.read_text())
-        metadata["id"] = rollout_path.name
+        metadata["id"] = rollout_id
         metadata["name"] = rollout_path.name
+        metadata["cameras"] = self._recording_cameras(metadata, rollout_path)
         metadata["overhead_processed"] = overhead_processed_status(rollout_path)
         self._ensure_task_state(metadata)
         metadata["task_trace"] = self._load_task_trace(rollout_path)
@@ -2187,6 +3261,9 @@ class DashboardApp:
                         "cameras": camera_files,
                         "telemetry": asdict(telemetry_state),
                     }
+                    control_stage = self._control_stage_snapshot()
+                    if control_stage is not None:
+                        sample["control_stage"] = control_stage
                     telemetry_file.write(json.dumps(sample, separators=(",", ":")) + "\n")
                     telemetry_file.flush()
                     sample_index += 1
@@ -2230,6 +3307,7 @@ class DashboardApp:
             "id": session.id,
             "name": session.path.name,
             "status": status,
+            "recording_kind": session.recording_kind,
             "started_at": session.started_at,
             "ended_at": time.time() if status == "complete" else None,
             "sample_hz": session.sample_hz,
@@ -2253,7 +3331,42 @@ class DashboardApp:
             "rest_result": rest_result,
             "error": session.error,
         }
+        control_meta = self._control_recording_metadata()
+        if control_meta is not None:
+            metadata["control_run"] = control_meta
         (session.path / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    def _control_stage_snapshot(self) -> dict[str, Any] | None:
+        with self.control_lock:
+            run = self.active_control_run
+            if run is None:
+                return None
+            command = run.commands[run.index] if 0 <= run.index < len(run.commands) else {}
+            return {
+                "run_id": run.id,
+                "command_index": run.index,
+                "coord": command.get("coord", ""),
+                "color": command.get("color", ""),
+                "stage": run.current_stage,
+                "stage_index": run.current_stage_index,
+                "total_commands": len(run.commands),
+            }
+
+    def _control_recording_metadata(self) -> dict[str, Any] | None:
+        with self.control_lock:
+            run = self.active_control_run
+            if run is None:
+                return None
+            command = run.commands[run.index] if 0 <= run.index < len(run.commands) else {}
+            return {
+                "id": run.id,
+                "command_index": run.index,
+                "coord": command.get("coord", ""),
+                "color": command.get("color", ""),
+                "stage": run.current_stage,
+                "stage_index": run.current_stage_index,
+                "record_each": run.record_each,
+            }
 
     def _recording_status(self, session: RecordingSession) -> dict[str, Any]:
         return {
@@ -2285,6 +3398,8 @@ class DashboardApp:
             "id": metadata_path.parent.name,
             "name": data.get("name", metadata_path.parent.name),
             "status": data.get("status", "unknown"),
+            "recording_kind": data.get("recording_kind", "teleoperation"),
+            "directory": str(metadata_path.parent),
             "started_at": data.get("started_at"),
             "ended_at": data.get("ended_at"),
             "samples": data.get("samples", 0),
@@ -2295,6 +3410,7 @@ class DashboardApp:
             "overhead_processed": overhead_processed_status(metadata_path.parent),
             "run_type": data.get("run_type"),
             "synthetic": data.get("synthetic"),
+            "control_run": data.get("control_run"),
         }
 
     def _recording_cameras(self, metadata: dict[str, Any], recording_path: Path) -> dict[str, Any]:
@@ -2329,8 +3445,26 @@ class DashboardApp:
         return path
 
     def _model_rollout_path_by_name(self, rollout_id: str) -> Path:
+        if "/" in rollout_id:
+            evaluation_id, rollout_name = rollout_id.split("/", 1)
+            safe_evaluation_id = Path(evaluation_id).name
+            safe_rollout_name = Path(rollout_name).name
+            path = self.model_evaluation_dir / safe_evaluation_id / safe_rollout_name
+            if path.is_dir():
+                return path
+            raise FileNotFoundError(f"{safe_evaluation_id}/{safe_rollout_name}")
         safe_name = Path(rollout_id).name
         path = self.model_rollout_dir / safe_name
+        if path.is_dir():
+            return path
+        if self.model_evaluation_dir.is_dir():
+            matches = [
+                candidate
+                for candidate in self.model_evaluation_dir.glob(f"*/{safe_name}")
+                if candidate.is_dir()
+            ]
+            if len(matches) == 1:
+                return matches[0]
         if not path.is_dir():
             raise FileNotFoundError(safe_name)
         return path
@@ -2341,6 +3475,14 @@ class DashboardApp:
         if not path.is_dir():
             raise FileNotFoundError(safe_name)
         return path
+
+    @staticmethod
+    def _path_is_relative_to(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except ValueError:
+            return False
 
     @staticmethod
     def _unique_recording_path(path: Path) -> Path:
@@ -2523,6 +3665,8 @@ class DashboardApp:
         )
         if corners is None:
             corners = auto_detect_board_corners(frame)
+        else:
+            corners = normalize_corners_for_image(corners, frame.shape)
         raw_corners = [[float(x), float(y)] for x, y in corners.tolist()]
         raw_state = BoardState(
             board_size=self.board.size,
@@ -3073,7 +4217,211 @@ class DashboardApp:
         }
         state["model_run"] = self.model_run_json()
         state["evaluator"] = self.evaluator_json()
+        state["control"] = self.control_json()
         return state
+
+
+DASHBOARD_SHELL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Go Board Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --line: #d8dee3;
+      --text: #182026;
+      --muted: #66727c;
+      --teal: #0f766e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 18px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .mark {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--teal);
+      box-shadow: 0 0 0 5px rgba(15, 118, 110, .14);
+      flex: 0 0 auto;
+    }
+    h1 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    nav {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+      flex: 0 0 auto;
+    }
+    .tab-button {
+      appearance: none;
+      border: 0;
+      border-right: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      min-height: 34px;
+      padding: 0 16px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .tab-button:last-child { border-right: 0; }
+    .tab-button.active {
+      background: var(--teal);
+      color: #fff;
+    }
+    main {
+      height: calc(100vh - 56px);
+      min-height: 0;
+      position: relative;
+    }
+    iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      display: none;
+      background: var(--bg);
+    }
+    iframe.active { display: block; }
+    @media (max-width: 720px) {
+      header {
+        height: auto;
+        min-height: 56px;
+        align-items: stretch;
+        flex-direction: column;
+        padding: 10px;
+      }
+      nav { width: 100%; }
+      .tab-button {
+        flex: 1 1 0;
+        padding: 0 8px;
+      }
+      main { height: calc(100vh - 104px); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="mark"></div>
+      <h1>Go Board Dashboard</h1>
+    </div>
+    <nav aria-label="Dashboard views">
+      <button class="tab-button" type="button" data-tab="training">Training</button>
+      <button class="tab-button" type="button" data-tab="control">Control</button>
+      <button class="tab-button" type="button" data-tab="evaluation">Evaluation</button>
+      <button class="tab-button" type="button" data-tab="vision">Vision</button>
+    </nav>
+  </header>
+  <main>
+    <iframe id="training-frame" title="Training view" data-tab="training" data-src="/training?embed=1"></iframe>
+    <iframe id="control-frame" title="Control view" data-tab="control" data-src="/control?embed=1"></iframe>
+    <iframe id="evaluation-frame" title="Evaluation view" data-tab="evaluation" data-src="/evaluate?embed=1"></iframe>
+    <iframe id="vision-frame" title="Vision view" data-tab="vision" data-src="/annotate?embed=1"></iframe>
+  </main>
+  <script>
+    const validTabs = new Set(['training', 'control', 'evaluation', 'vision']);
+    const buttons = Array.from(document.querySelectorAll('.tab-button'));
+    const frames = Array.from(document.querySelectorAll('iframe[data-tab]'));
+
+    function tabFromLocation() {
+      const params = new URLSearchParams(window.location.search);
+      const queryTab = params.get('tab');
+      if (validTabs.has(queryTab)) return queryTab;
+      const hashTab = window.location.hash.replace(/^#/, '');
+      if (validTabs.has(hashTab)) return hashTab;
+      return 'training';
+    }
+
+    function activateTab(tab, { push = true } = {}) {
+      const nextTab = validTabs.has(tab) ? tab : 'training';
+      for (const button of buttons) {
+        button.classList.toggle('active', button.dataset.tab === nextTab);
+        button.setAttribute('aria-selected', button.dataset.tab === nextTab ? 'true' : 'false');
+      }
+      for (const frame of frames) {
+        const active = frame.dataset.tab === nextTab;
+        frame.classList.toggle('active', active);
+        if (active && !frame.src) frame.src = frame.dataset.src;
+      }
+      if (push) {
+        const url = nextTab === 'training' ? '/' : `/?tab=${nextTab}`;
+        window.history.pushState({ tab: nextTab }, '', url);
+      }
+    }
+
+    for (const button of buttons) {
+      button.addEventListener('click', () => activateTab(button.dataset.tab));
+    }
+    window.addEventListener('popstate', () => activateTab(tabFromLocation(), { push: false }));
+    activateTab(tabFromLocation(), { push: false });
+  </script>
+</body>
+</html>
+"""
+
+
+EMBEDDED_VIEW_STYLE = """
+  <style>
+    body.dashboard-embedded > header,
+    body.dashboard-embedded .app > header,
+    body.dashboard-embedded .session-link {
+      display: none !important;
+    }
+    body.dashboard-embedded .app {
+      min-height: 100vh;
+    }
+    body.dashboard-embedded main {
+      min-height: 100vh !important;
+      height: auto !important;
+    }
+    body.dashboard-embedded.vision-view main {
+      height: 100vh !important;
+    }
+    body.dashboard-embedded.training-view #model-rollout-panel {
+      display: none !important;
+    }
+  </style>
+"""
+
+
+def embedded_dashboard_html(html: str, view: str) -> str:
+    rendered = html.replace("<body>", f'<body class="dashboard-embedded {view}-view">', 1)
+    return rendered.replace("</head>", f"{EMBEDDED_VIEW_STYLE}</head>", 1)
 
 
 HTML = r"""<!doctype html>
@@ -3777,7 +5125,7 @@ HTML = r"""<!doctype html>
           </div>
           <ul id="synthetic-recordings" class="recordings"></ul>
         </section>
-        <section class="panel">
+        <section id="model-rollout-panel" class="panel">
           <div class="panel-title">
             <span>Model Rollout</span>
             <span id="model-state">idle</span>
@@ -4064,25 +5412,30 @@ HTML = r"""<!doctype html>
       document.getElementById('age').textContent = `${Math.max(0, Date.now() / 1000 - state.timestamp).toFixed(1)} s`;
       document.getElementById('note').textContent = state.note || '';
 
-      for (const camera of state.cameras) ensureCamera(camera);
-      for (const camera of state.cameras) {
-        const view = cameraImages.get(camera.name);
-        view.img.src = cameraUrl(camera.name);
-        const modelPreviewActive = Boolean(state.model_run?.active?.preview?.available);
-        const healthClass = modelPreviewActive ? 'ok' : !camera.fresh ? 'bad' : camera.dark ? 'warn' : 'ok';
-        const healthText = modelPreviewActive
-          ? (camera.name === state.board?.camera ? 'model + target' : 'model')
-          : !camera.fresh ? 'no frame' : camera.dark ? `dark ${camera.brightness}` : `ok ${camera.brightness}`;
-        view.health.className = `badge ${healthClass}`;
-        view.health.textContent = healthText;
-        view.shape.textContent = camera.actual_width && camera.actual_height
-          ? `${camera.actual_width}x${camera.actual_height}@${camera.measured_fps}`
-          : `${camera.width}x${camera.height}@${camera.fps}`;
-        const warningText = camera.dark
-          ? 'This feed is very dark. Check the camera index, lens cover, exposure, or lighting.'
-          : '';
-        view.warning.textContent = warningText;
-        view.warning.classList.toggle('visible', Boolean(warningText));
+      if (!replayRecording) {
+        for (const camera of state.cameras) ensureCamera(camera);
+        for (const camera of state.cameras) {
+          const view = cameraImages.get(camera.name);
+          view.img.src = cameraUrl(camera.name);
+          const modelPreviewActive = Boolean(state.model_run?.active?.preview?.available);
+          const healthClass = modelPreviewActive ? 'ok' : camera.error || !camera.fresh ? 'bad' : camera.dark ? 'warn' : 'ok';
+          const healthText = modelPreviewActive
+            ? (camera.name === state.board?.camera ? 'model + target' : 'model')
+            : camera.error ? 'missing'
+              : !camera.fresh ? 'no frame' : camera.dark ? `dark ${camera.brightness}` : `ok ${camera.brightness}`;
+          view.health.className = `badge ${healthClass}`;
+          view.health.textContent = healthText;
+          view.shape.textContent = camera.actual_width && camera.actual_height
+            ? `${camera.actual_width}x${camera.actual_height}@${camera.measured_fps}`
+            : `${camera.width}x${camera.height}@${camera.fps}`;
+          const warningText = camera.error
+            ? camera.error
+            : camera.dark
+            ? 'This feed is very dark. Check the camera index, lens cover, exposure, or lighting.'
+            : '';
+          view.warning.textContent = warningText;
+          view.warning.classList.toggle('visible', Boolean(warningText));
+        }
       }
 
       const teleopButton = document.getElementById('teleop-button');
@@ -4673,7 +6026,11 @@ HTML = r"""<!doctype html>
       for (const camera of cameras) {
         const view = cameraImages.get(camera);
         if (!view) continue;
-        view.img.src = cameraUrl(camera);
+        const nextUrl = cameraUrl(camera);
+        if (view.img.dataset.replaySrc !== nextUrl) {
+          view.img.dataset.replaySrc = nextUrl;
+          view.img.src = nextUrl;
+        }
         view.health.className = 'badge ok';
         view.health.textContent = 'saved';
         view.shape.textContent = `frame ${replayFrame + 1}/${Math.max(1, replayRecording.samples || 1)}`;
@@ -4707,6 +6064,9 @@ HTML = r"""<!doctype html>
       slider.max = '0';
       slider.value = '0';
       document.getElementById('replay-button').textContent = 'Play';
+      for (const view of cameraImages.values()) {
+        delete view.img.dataset.replaySrc;
+      }
       renderReplayTaskState(null);
       renderReplayDelta(null);
       renderRecordings(recordingsLoaded);
@@ -4952,6 +6312,717 @@ HTML = r"""<!doctype html>
 """
 
 
+CONTROL_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Go Joint Control</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f8;
+      --panel: #ffffff;
+      --line: #d8dee3;
+      --text: #182026;
+      --muted: #66727c;
+      --teal: #0f766e;
+      --amber: #b7791f;
+      --red: #b42318;
+      --blue: #2364aa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 0 18px;
+      background: #fff;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 16px; line-height: 1; }
+    main {
+      display: grid;
+      grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
+      gap: 14px;
+      padding: 14px;
+      min-height: calc(100vh - 56px);
+    }
+    .stack { display: grid; gap: 14px; align-content: start; }
+    .panel {
+      min-width: 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-title {
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .session-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      text-decoration: none;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 10px;
+    }
+    .wide { grid-column: 1 / -1; }
+    label {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+    }
+    input,
+    select,
+    textarea {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 9px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    textarea {
+      min-height: 82px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      line-height: 1.35;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 9px 12px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary { color: #fff; border-color: var(--teal); background: var(--teal); }
+    button.danger { color: var(--red); border-color: #e7a39e; }
+    button.active { color: #fff; border-color: var(--red); background: var(--red); }
+    button:disabled { color: var(--muted); cursor: not-allowed; background: #edf1f3; }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      padding: 0 10px 10px;
+    }
+    .actions.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .anchors {
+      display: grid;
+      gap: 6px;
+      padding: 10px;
+    }
+    .anchor-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcfd;
+    }
+    .anchor-row strong { display: block; font-size: 13px; }
+    .anchor-row span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-size: 11px;
+      line-height: 1.4;
+      background: #f7fafb;
+      white-space: nowrap;
+    }
+    .badge.ok { color: var(--teal); border-color: #9fd8d2; background: #eefaf8; }
+    .badge.warn { color: var(--amber); border-color: #e8c780; background: #fff8e8; }
+    .badge.bad { color: var(--red); border-color: #e7a39e; background: #fff3f2; }
+    .note {
+      min-height: 26px;
+      padding: 0 10px 10px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .feeds {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .camera {
+      display: grid;
+      grid-template-rows: 40px minmax(220px, 1fr);
+      min-height: 0;
+    }
+    .camera-frame {
+      position: relative;
+      min-height: 220px;
+      background: #101820;
+    }
+    .camera-frame img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .pose {
+      margin: 0 10px 10px;
+      max-height: 180px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #101820;
+      color: #dbe7ec;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    .results {
+      margin: 0;
+      padding: 0 10px 10px;
+      list-style: none;
+      display: grid;
+      gap: 6px;
+      max-height: 280px;
+      overflow: auto;
+    }
+    .results li {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcfd;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .inline {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .inline input[type="checkbox"] { width: auto; }
+    @media (max-width: 980px) {
+      main { grid-template-columns: 1fr; }
+      .feeds { grid-template-columns: 1fr; }
+      .actions { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Go Joint Control</h1>
+    <a class="session-link" href="/">Back to Dashboard</a>
+  </header>
+  <main>
+    <section class="stack">
+      <section class="panel">
+        <div class="panel-title">
+          <span>Calibration</span>
+          <span id="calibration-state" class="badge">waiting</span>
+        </div>
+        <div class="actions two">
+          <button id="teleop-toggle" type="button">Start Teleop</button>
+          <button id="capture-rest" type="button">Move Rest</button>
+        </div>
+        <div id="anchors" class="anchors"></div>
+        <div id="calibration-note" class="note"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span>Motion</span>
+          <span id="run-state">idle</span>
+        </div>
+        <div class="grid">
+          <label>Coord
+            <input id="target-coord" value="K10" autocomplete="off" />
+          </label>
+          <label>Batch Count
+            <input id="batch-count" type="number" min="1" max="361" value="100" />
+          </label>
+          <label>Target Color
+            <select id="target-color">
+              <option value="black">Black</option>
+              <option value="white">White</option>
+            </select>
+          </label>
+          <label class="wide">Commands
+            <textarea id="commands" spellcheck="false">K10 black</textarea>
+          </label>
+          <label class="inline wide">
+            <input id="record-each" type="checkbox" checked />
+            <span>Record each move</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="preview" type="button">Preview</button>
+          <button id="move-above" type="button">Move Above</button>
+          <button id="move-lower" type="button">Move Lower</button>
+          <button id="move-bowl" type="button">Move Bowl</button>
+          <button id="run-one" class="primary" type="button">Run One</button>
+          <button id="stop-run" class="danger" type="button">Stop</button>
+        </div>
+        <div class="actions two">
+          <button id="generate" type="button">Generate Batch</button>
+          <button id="run-batch" class="primary" type="button">Run Batch</button>
+        </div>
+        <div id="motion-note" class="note"></div>
+        <pre id="pose" class="pose">No pose preview.</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span>Settings</span>
+          <span id="settings-state">saved</span>
+        </div>
+        <div class="grid">
+          <label>Grip Open
+            <input id="gripper-open" type="number" step="0.01" />
+          </label>
+          <label>Grip Closed
+            <input id="gripper-closed" type="number" step="0.01" />
+          </label>
+          <label>Move Duration
+            <input id="move-duration" type="number" min="0.05" step="0.05" />
+          </label>
+          <label>Lower Duration
+            <input id="lower-duration" type="number" min="0.05" step="0.05" />
+          </label>
+          <label>Board Lower (m)
+            <input id="board-lower-m" type="number" min="0" step="0.001" />
+          </label>
+          <label>Bowl Lower (m)
+            <input id="bowl-lower-m" type="number" min="0" step="0.001" />
+          </label>
+        </div>
+        <div class="actions two">
+          <button id="capture-gripper-open" type="button">Capture Open</button>
+          <button id="capture-gripper-closed" type="button">Capture Closed</button>
+        </div>
+        <div class="actions two">
+          <button id="capture-bowl-lower" type="button">Capture Bowl Lower</button>
+          <button id="capture-board-lower" type="button">Capture Board Lower</button>
+        </div>
+        <div class="actions two">
+          <button id="save-settings" class="primary" type="button">Save Settings</button>
+          <button id="move-rest" type="button">Move Rest</button>
+        </div>
+        <div id="settings-note" class="note"></div>
+      </section>
+    </section>
+
+    <section class="stack">
+      <section id="control-feeds" class="feeds"></section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Run Results</span>
+          <span id="progress">0/0</span>
+        </div>
+        <ul id="results" class="results"></ul>
+      </section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Saved Recordings</span>
+          <span id="recording-count">0</span>
+        </div>
+        <ul id="control-recordings" class="results"></ul>
+      </section>
+    </section>
+  </main>
+  <script>
+    const goColumns = 'ABCDEFGHJKLMNOPQRST';
+    const anchorLabels = [
+      ['top_left', 'Top Left'],
+      ['top_right', 'Top Right'],
+      ['bottom_right', 'Bottom Right'],
+      ['bottom_left', 'Bottom Left'],
+      ['black_bowl', 'Black Bowl'],
+      ['white_bowl', 'White Bowl'],
+    ];
+    const feeds = document.getElementById('control-feeds');
+    const cameraImages = new Map();
+    let defaultsLoaded = false;
+    let cachedControl = null;
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+      }[ch]));
+    }
+
+    function fmtTime(value) {
+      if (!value) return 'not captured';
+      return new Date(Number(value) * 1000).toLocaleTimeString();
+    }
+
+    function ensureCamera(camera) {
+      if (cameraImages.has(camera.name)) return;
+      const panel = document.createElement('article');
+      panel.className = 'panel camera';
+      panel.innerHTML = `
+        <div class="panel-title">
+          <span>${escapeHtml(camera.name)}</span>
+          <span data-role="health" class="badge">waiting</span>
+        </div>
+        <div class="camera-frame">
+          <img alt="${escapeHtml(camera.name)} camera feed" />
+        </div>
+      `;
+      feeds.appendChild(panel);
+      cameraImages.set(camera.name, {
+        img: panel.querySelector('img'),
+        health: panel.querySelector('[data-role="health"]'),
+      });
+    }
+
+    function renderAnchors(defaults) {
+      const root = document.getElementById('anchors');
+      root.innerHTML = '';
+      const anchors = defaults.anchors || {};
+      for (const [key, label] of anchorLabels) {
+        const item = anchors[key] || {};
+        const jointCount = Object.keys(item.joints || {}).length;
+        const row = document.createElement('div');
+        row.className = 'anchor-row';
+        row.innerHTML = `
+          <div>
+            <strong>${label}</strong>
+            <span>${jointCount ? `${jointCount} joints · ${fmtTime(item.captured_at)} · ${escapeHtml(item.source || '')}` : 'not captured'}</span>
+          </div>
+          <button type="button" data-anchor="${key}">Capture</button>
+        `;
+        row.querySelector('button').addEventListener('click', () => captureAnchor(key));
+        root.appendChild(row);
+      }
+    }
+
+    function renderSettings(defaults) {
+      if (defaultsLoaded) return;
+      document.getElementById('gripper-open').value = defaults.gripper_open ?? '';
+      document.getElementById('gripper-closed').value = defaults.gripper_closed ?? '';
+      document.getElementById('move-duration').value = defaults.move_duration_s ?? 2;
+      document.getElementById('lower-duration').value = defaults.lower_duration_s ?? 1;
+      document.getElementById('board-lower-m').value = defaults.board_lower_m ?? 0.01;
+      document.getElementById('bowl-lower-m').value = defaults.bowl_lower_m ?? 0.01;
+      defaultsLoaded = true;
+    }
+
+    function renderRun(run) {
+      document.getElementById('run-state').textContent = run?.status || 'idle';
+      document.getElementById('progress').textContent = run ? `${(run.attempts || []).length}/${run.total || 0}` : '0/0';
+      const list = document.getElementById('results');
+      list.innerHTML = '';
+      if (run?.current_stage) {
+        const li = document.createElement('li');
+        li.innerHTML = `
+          <span class="badge warn">running</span>
+          <strong>${escapeHtml(run.current_stage)}</strong>
+          <div>${Number(run.index || 0) + 1}/${Number(run.total || 0)} · ${escapeHtml(run.message || '')}</div>
+        `;
+        list.appendChild(li);
+      }
+      const attempts = run?.attempts || [];
+      for (const attempt of attempts) {
+        const li = document.createElement('li');
+        const status = attempt.success ? 'ok' : 'bad';
+        li.innerHTML = `
+          <span class="badge ${status}">${attempt.success ? 'moved' : 'failed'}</span>
+          <strong>${Number(attempt.index) + 1}. ${escapeHtml(attempt.color)} to ${escapeHtml(attempt.coord)}</strong>
+          <div>${escapeHtml(attempt.error || attempt.move?.failed_step || attempt.recording?.recording?.name || '')}</div>
+        `;
+        list.appendChild(li);
+      }
+      if (attempts.length === 0 && !run?.current_stage) {
+        list.innerHTML = '<li>No moves yet.</li>';
+      }
+    }
+
+    function renderRecordings(recordings) {
+      const list = document.getElementById('control-recordings');
+      const items = (recordings || []).slice().sort((a, b) => Number(b.started_at || 0) - Number(a.started_at || 0));
+      list.innerHTML = '';
+      document.getElementById('recording-count').textContent = String(items.length);
+      for (const item of items.slice(0, 20)) {
+        const control = item.control_run || {};
+        const label = control.coord
+          ? `${control.color || ''} to ${control.coord}`
+          : item.move_name || item.name || item.id;
+        const li = document.createElement('li');
+        li.innerHTML = `
+          <span class="badge ${item.status === 'complete' ? 'ok' : 'warn'}">${escapeHtml(item.status || 'saved')}</span>
+          <strong>${escapeHtml(item.name || item.id)}</strong>
+          <div>${escapeHtml(label)} · ${Number(item.samples || 0)} frames</div>
+        `;
+        list.appendChild(li);
+      }
+      if (items.length === 0) {
+        list.innerHTML = '<li>No saved recordings yet.</li>';
+      }
+    }
+
+    function updateControl(data) {
+      cachedControl = data;
+      const defaults = data.defaults || {};
+      renderAnchors(defaults);
+      renderSettings(defaults);
+      const ready = Boolean(defaults.board_ready && defaults.bowls_ready);
+      const badge = document.getElementById('calibration-state');
+      badge.className = `badge ${ready ? 'ok' : defaults.board_ready ? 'warn' : 'bad'}`;
+      badge.textContent = ready ? 'ready' : defaults.board_ready ? 'bowls needed' : 'corners needed';
+      document.getElementById('calibration-note').textContent = data.message || '';
+      document.getElementById('motion-note').textContent = data.active?.message || data.message || '';
+      document.getElementById('stop-run').disabled = !data.active;
+      renderRun(data.active || data.last || null);
+    }
+
+    async function refreshControl() {
+      const response = await fetch('/api/control', { cache: 'no-store' });
+      updateControl(await response.json());
+    }
+
+    async function refreshRecordings() {
+      const response = await fetch('/api/control_recordings', { cache: 'no-store' });
+      const result = await response.json().catch(() => ({ recordings: [] }));
+      renderRecordings(result.recordings || []);
+    }
+
+    async function refreshState() {
+      const response = await fetch('/api/state', { cache: 'no-store' });
+      const state = await response.json();
+      const teleopButton = document.getElementById('teleop-toggle');
+      teleopButton.classList.toggle('active', Boolean(state.teleop_enabled));
+      teleopButton.textContent = state.teleop_enabled ? 'Stop Teleop' : 'Start Teleop';
+      for (const camera of state.cameras || []) ensureCamera(camera);
+      for (const camera of state.cameras || []) {
+        const view = cameraImages.get(camera.name);
+        if (!view) continue;
+        const rotate = camera.name === 'overhead' ? '&rotate=left' : '';
+        view.img.src = `/api/camera/${encodeURIComponent(camera.name)}.jpg?t=${Date.now()}${rotate}`;
+        const status = camera.error || !camera.fresh ? 'bad' : camera.dark ? 'warn' : 'ok';
+        view.health.className = `badge ${status}`;
+        view.health.textContent = camera.error
+          ? 'missing'
+          : !camera.fresh ? 'no frame' : camera.dark ? `dark ${camera.brightness}` : `ok ${camera.brightness}`;
+      }
+    }
+
+    async function postControl(payload) {
+      const response = await fetch('/api/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('motion-note').textContent = result.error || 'Control request failed.';
+        return null;
+      }
+      await refreshControl();
+      return result;
+    }
+
+    async function toggleTeleop() {
+      const enabled = !document.getElementById('teleop-toggle').classList.contains('active');
+      const response = await fetch('/api/teleop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('calibration-note').textContent = result.error || 'Could not toggle teleop.';
+        return;
+      }
+      document.getElementById('calibration-note').textContent = enabled
+        ? 'Teleoperation enabled. Move the follower, then stop teleop and capture an anchor.'
+        : 'Teleoperation stopped. Capture the follower position for the selected anchor.';
+      await refreshState();
+    }
+
+    async function captureAnchor(anchor) {
+      const result = await postControl({
+        action: 'capture_anchor',
+        anchor,
+      });
+      if (result) document.getElementById('calibration-note').textContent = `Captured ${anchor.replaceAll('_', ' ')}.`;
+    }
+
+    async function captureGripper(setting) {
+      const result = await postControl({
+        action: 'capture_gripper',
+        setting,
+      });
+      if (!result) {
+        document.getElementById('settings-note').textContent = `Could not capture gripper ${setting}.`;
+        return;
+      }
+      const input = setting === 'open'
+        ? document.getElementById('gripper-open')
+        : document.getElementById('gripper-closed');
+      input.value = Number(result.value).toFixed(2);
+      document.getElementById('settings-note').textContent =
+        `Captured gripper ${setting}: ${Number(result.value).toFixed(2)}.`;
+    }
+
+    async function captureLowerDelta(target) {
+      const payload = { action: 'capture_lower_delta', target };
+      if (target === 'bowl') payload.color = document.getElementById('target-color').value;
+      if (target === 'board') payload.coord = document.getElementById('target-coord').value;
+      const result = await postControl(payload);
+      if (!result) {
+        document.getElementById('settings-note').textContent = `Could not capture ${target} lower delta.`;
+        return;
+      }
+      const input = target === 'bowl'
+        ? document.getElementById('bowl-lower-m')
+        : document.getElementById('board-lower-m');
+      input.value = Number(result.lower_m || 0).toFixed(3);
+      document.getElementById('settings-note').textContent =
+        `Captured ${target} lower distance: ${Number(result.lower_m || 0).toFixed(3)} m.`;
+    }
+
+    async function saveSettings() {
+      const result = await postControl({
+        action: 'save_settings',
+        gripper_open: document.getElementById('gripper-open').value,
+        gripper_closed: document.getElementById('gripper-closed').value,
+        move_duration_s: Number(document.getElementById('move-duration').value || 2),
+        lower_duration_s: Number(document.getElementById('lower-duration').value || 1),
+        board_lower_m: Number(document.getElementById('board-lower-m').value || 0),
+        bowl_lower_m: Number(document.getElementById('bowl-lower-m').value || 0),
+      });
+      document.getElementById('settings-note').textContent = result ? 'Saved.' : 'Could not save settings.';
+    }
+
+    async function preview() {
+      const coord = document.getElementById('target-coord').value;
+      const result = await postControl({ action: 'preview', coord });
+      if (result?.pose) {
+        document.getElementById('pose').textContent = JSON.stringify({
+          interpolation: result.interpolation,
+          pose: result.pose,
+        }, null, 2);
+      }
+    }
+
+    async function moveTarget(target, lower = false) {
+      const payload = { action: 'move', target, lower };
+      if (target === 'board') payload.coord = document.getElementById('target-coord').value;
+      await postControl(payload);
+    }
+
+    function parsedCommands(single = false) {
+      if (single) {
+        return [{
+          coord: document.getElementById('target-coord').value,
+          color: document.getElementById('target-color').value,
+        }];
+      }
+      const commands = [];
+      for (const line of document.getElementById('commands').value.split('\n')) {
+        const parts = line.trim().replace(',', ' ').split(/\s+/).filter(Boolean);
+        if (parts.length === 0) continue;
+        commands.push({ coord: parts[0], color: parts[1] || document.getElementById('target-color').value });
+      }
+      return commands;
+    }
+
+    async function startRun(single) {
+      await postControl({
+        action: 'start',
+        commands: parsedCommands(single),
+        record_each: document.getElementById('record-each').checked,
+      });
+    }
+
+    function generateBatch() {
+      const count = Math.max(1, Math.min(361, Number(document.getElementById('batch-count').value || 100)));
+      const coords = [];
+      for (let row = 1; row <= 19; row += 1) {
+        for (const col of goColumns) coords.push(`${col}${row}`);
+      }
+      for (let index = coords.length - 1; index > 0; index -= 1) {
+        const swap = Math.floor(Math.random() * (index + 1));
+        [coords[index], coords[swap]] = [coords[swap], coords[index]];
+      }
+      const colors = ['black', 'white'];
+      document.getElementById('commands').value = coords.slice(0, count)
+        .map((coord, index) => `${coord} ${colors[index % 2]}`)
+        .join('\n');
+    }
+
+    document.getElementById('save-settings').addEventListener('click', saveSettings);
+    document.getElementById('capture-gripper-open').addEventListener('click', () => captureGripper('open'));
+    document.getElementById('capture-gripper-closed').addEventListener('click', () => captureGripper('closed'));
+    document.getElementById('capture-bowl-lower').addEventListener('click', () => captureLowerDelta('bowl'));
+    document.getElementById('capture-board-lower').addEventListener('click', () => captureLowerDelta('board'));
+    document.getElementById('teleop-toggle').addEventListener('click', toggleTeleop);
+    document.getElementById('capture-rest').addEventListener('click', () => moveTarget('rest', false));
+    document.getElementById('preview').addEventListener('click', preview);
+    document.getElementById('move-above').addEventListener('click', () => moveTarget('board', false));
+    document.getElementById('move-lower').addEventListener('click', () => moveTarget('board', true));
+    document.getElementById('move-bowl').addEventListener('click', () => moveTarget(`${document.getElementById('target-color').value}_bowl`, false));
+    document.getElementById('move-rest').addEventListener('click', () => moveTarget('rest', false));
+    document.getElementById('run-one').addEventListener('click', () => startRun(true));
+    document.getElementById('run-batch').addEventListener('click', () => startRun(false));
+    document.getElementById('stop-run').addEventListener('click', () => postControl({ action: 'stop' }));
+    document.getElementById('generate').addEventListener('click', generateBatch);
+
+    refreshControl().catch(() => null);
+    refreshRecordings().catch(() => null);
+    refreshState().catch(() => null);
+    setInterval(() => refreshControl().catch(() => null), 1000);
+    setInterval(() => refreshRecordings().catch(() => null), 3000);
+    setInterval(() => refreshState().catch(() => null), 500);
+  </script>
+</body>
+</html>
+"""
+
+
 EVALUATOR_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -5151,8 +7222,132 @@ EVALUATOR_HTML = r"""<!doctype html>
       display: grid;
       gap: 14px;
     }
+    .feeds {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .camera {
+      display: grid;
+      grid-template-rows: 40px minmax(180px, 1fr);
+      min-height: 0;
+    }
+    .panel-meta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .camera-frame {
+      position: relative;
+      min-height: 180px;
+      background: #101820;
+    }
+    .camera-frame img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .history-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 10px;
+    }
+    .history-column {
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+    }
+    .history-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .history-list {
+      display: grid;
+      gap: 6px;
+      max-height: 260px;
+      overflow: auto;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+    .history-list li {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcfd;
+      font-size: 12px;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+    .history-list strong {
+      display: block;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.25;
+    }
+    .history-list span {
+      display: block;
+      color: var(--muted);
+      margin-top: 2px;
+      line-height: 1.35;
+    }
+    .history-list .history-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: stretch;
+    }
+    .history-list .history-main {
+      border: 0;
+      background: transparent;
+      padding: 0;
+      text-align: left;
+      min-width: 0;
+      color: inherit;
+    }
+    .history-list .delete-one {
+      color: var(--red);
+      border-color: #e7a39e;
+      background: #fffafa;
+      padding: 6px 10px;
+      align-self: start;
+    }
+    .history-list li.selected {
+      border-color: var(--blue);
+      background: #f2f7ff;
+    }
+    .replay-controls {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+    }
+    .replay-controls input {
+      padding: 0;
+    }
+    .replay-note {
+      padding: 0 10px 10px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 24px;
+    }
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; }
+      .feeds,
+      .history-grid { grid-template-columns: 1fr; }
       .sequence { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
@@ -5175,6 +7370,12 @@ EVALUATOR_HTML = r"""<!doctype html>
           </label>
           <label class="wide">Remote Policy Server
             <input id="remote-policy-server" autocomplete="off" placeholder="desktop:8080" />
+          </label>
+          <label>Environment
+            <select id="environment">
+              <option value="real">Real Life</option>
+              <option value="mujoco">MuJoCo Simulation</option>
+            </select>
           </label>
           <label>Policy Type
             <input id="policy-type" autocomplete="off" />
@@ -5206,6 +7407,19 @@ EVALUATOR_HTML = r"""<!doctype html>
       <div id="message" class="note"></div>
     </section>
     <section class="results">
+      <section id="eval-feeds" class="feeds"></section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Replay</span>
+          <span id="replay-title">No rollout selected</span>
+        </div>
+        <div class="replay-controls">
+          <button id="replay-play" type="button">Play</button>
+          <input id="replay-slider" type="range" min="0" max="0" value="0" />
+          <span id="replay-frame">0/0</span>
+        </div>
+        <div id="replay-note" class="replay-note">Pick a saved policy run below to inspect its camera sequence.</div>
+      </section>
       <section class="panel">
         <div class="panel-title">
           <span>Summary</span>
@@ -5244,11 +7458,42 @@ EVALUATOR_HTML = r"""<!doctype html>
           <tbody id="results"></tbody>
         </table>
       </section>
+      <section class="panel">
+        <div class="panel-title">
+          <span>Previous Runs</span>
+          <span id="history-status">-</span>
+        </div>
+        <div class="history-grid">
+          <div class="history-column">
+            <div class="history-heading">
+              <span>Evaluations</span>
+              <span id="evaluation-count">0</span>
+            </div>
+            <ul id="evaluation-history" class="history-list"></ul>
+          </div>
+          <div class="history-column">
+            <div class="history-heading">
+              <span>Rollouts</span>
+              <span id="rollout-count">0</span>
+            </div>
+            <ul id="rollout-history" class="history-list"></ul>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
   <script>
     let defaultsLoaded = false;
     let commands = [];
+    const evalFeeds = document.getElementById('eval-feeds');
+    const evalCameraImages = new Map();
+    let selectedRollout = null;
+    let selectedEvaluationId = null;
+    let replayFrame = 0;
+    let replayTimer = null;
+    let cachedRollouts = [];
+    let cachedEvaluations = [];
+    let defaultRemotePolicyServer = '';
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -5256,12 +7501,195 @@ EVALUATOR_HTML = r"""<!doctype html>
       }[ch]));
     }
 
+    function ensureEvalCamera(camera) {
+      if (evalCameraImages.has(camera.name)) return;
+      const panel = document.createElement('article');
+      panel.className = 'panel camera';
+      panel.innerHTML = `
+        <div class="panel-title">
+          <span>${escapeHtml(camera.name)}</span>
+          <span class="panel-meta">
+            <span data-role="health" class="badge">waiting</span>
+            <span data-role="shape">${escapeHtml(camera.width)}x${escapeHtml(camera.height)}@${escapeHtml(camera.fps)}</span>
+          </span>
+        </div>
+        <div class="camera-frame">
+          <img alt="${escapeHtml(camera.name)} camera feed" />
+        </div>
+      `;
+      evalFeeds.appendChild(panel);
+      evalCameraImages.set(camera.name, {
+        img: panel.querySelector('img'),
+        health: panel.querySelector('[data-role="health"]'),
+        shape: panel.querySelector('[data-role="shape"]'),
+      });
+    }
+
+    async function refreshEvaluationCameras() {
+      if (selectedRollout) return;
+      const response = await fetch('/api/state', { cache: 'no-store' });
+      const state = await response.json();
+      for (const camera of state.cameras || []) ensureEvalCamera(camera);
+      for (const camera of state.cameras || []) {
+        const view = evalCameraImages.get(camera.name);
+        if (!view) continue;
+        const rotate = camera.name === 'overhead' ? '&rotate=left' : '';
+        view.img.src = `/api/camera/${encodeURIComponent(camera.name)}.jpg?t=${Date.now()}${rotate}`;
+        const status = camera.error || !camera.fresh ? 'bad' : camera.dark ? 'warn' : 'ok';
+        view.health.className = `badge ${status}`;
+        view.health.textContent = camera.error
+          ? 'missing'
+          : !camera.fresh ? 'no frame' : camera.dark ? `dark ${camera.brightness}` : `ok ${camera.brightness}`;
+        view.shape.textContent = camera.actual_width && camera.actual_height
+          ? `${camera.actual_width}x${camera.actual_height}@${camera.measured_fps}`
+          : `${camera.width}x${camera.height}@${camera.fps}`;
+      }
+    }
+
+    function rolloutCameraNames(rollout) {
+      const cameras = rollout?.cameras || {};
+      if (Array.isArray(cameras)) return cameras;
+      return Object.keys(cameras);
+    }
+
+    function stopReplayTimer() {
+      if (!replayTimer) return;
+      window.clearInterval(replayTimer);
+      replayTimer = null;
+      document.getElementById('replay-play').textContent = 'Play';
+    }
+
+    function updateReplayFrame() {
+      if (!selectedRollout) return;
+      const cameraNames = rolloutCameraNames(selectedRollout);
+      for (const cameraName of cameraNames) {
+        const meta = selectedRollout.cameras?.[cameraName] || {};
+        ensureEvalCamera({
+          name: cameraName,
+          width: meta.width || 0,
+          height: meta.height || 0,
+          fps: meta.fps || selectedRollout.sample_hz || 10,
+        });
+        const view = evalCameraImages.get(cameraName);
+        if (!view) continue;
+        const nextUrl = `/api/model_rollout_frame/${encodeURIComponent(selectedRollout.id)}/${encodeURIComponent(cameraName)}.jpg?frame=${replayFrame}&t=${Date.now()}`;
+        view.img.src = nextUrl;
+        view.health.className = 'badge ok';
+        view.health.textContent = 'saved';
+        view.shape.textContent = `frame ${replayFrame + 1}/${Math.max(1, selectedRollout.samples || 1)}`;
+      }
+      document.getElementById('replay-slider').value = String(replayFrame);
+      document.getElementById('replay-frame').textContent = `${replayFrame + 1}/${Math.max(1, selectedRollout.samples || 1)}`;
+      document.getElementById('replay-title').textContent = selectedRollout.name || selectedRollout.id;
+      document.getElementById('replay-note').textContent =
+        `${selectedRollout.move_name || selectedRollout.task || 'policy run'} · ${selectedRollout.samples || 0} frames`;
+    }
+
+    function toggleReplay() {
+      if (!selectedRollout) return;
+      if (replayTimer) {
+        stopReplayTimer();
+        return;
+      }
+      document.getElementById('replay-play').textContent = 'Pause';
+      replayTimer = window.setInterval(() => {
+        const maxFrame = Math.max(0, Number(selectedRollout.samples || 1) - 1);
+        replayFrame = replayFrame >= maxFrame ? 0 : replayFrame + 1;
+        updateReplayFrame();
+      }, Math.max(50, 1000 / Math.max(1, Number(selectedRollout.sample_hz || 10))));
+    }
+
+    function clearSelectedRollout() {
+      stopReplayTimer();
+      selectedRollout = null;
+      replayFrame = 0;
+      document.getElementById('replay-slider').max = '0';
+      document.getElementById('replay-slider').value = '0';
+      document.getElementById('replay-frame').textContent = '0/0';
+      document.getElementById('replay-title').textContent = 'No rollout selected';
+      document.getElementById('replay-note').textContent =
+        selectedEvaluationId
+          ? 'Pick one of this evaluation\'s rollouts below to inspect its camera sequence.'
+          : 'Pick an evaluation below, then choose a rollout to inspect its camera sequence.';
+    }
+
+    async function loadRollout(id) {
+      if (selectedRollout?.id === id || selectedRollout?.name === id) {
+        clearSelectedRollout();
+        await refreshEvaluationCameras();
+        await refreshHistory();
+        return;
+      }
+      const response = await fetch(`/api/model_rollout?id=${encodeURIComponent(id)}`, { cache: 'no-store' });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('replay-note').textContent = result.error || 'Could not load rollout.';
+        return;
+      }
+      stopReplayTimer();
+      selectedRollout = result.model_rollout;
+      replayFrame = 0;
+      const maxFrame = Math.max(0, Number(selectedRollout.samples || 1) - 1);
+      document.getElementById('replay-slider').max = String(maxFrame);
+      document.getElementById('replay-slider').value = '0';
+      updateReplayFrame();
+      await refreshHistory();
+      updateReplayFrame();
+    }
+
+    async function deleteRollout(id) {
+      if (!window.confirm(`Delete saved policy run ${id}?`)) return;
+      stopReplayTimer();
+      const response = await fetch('/api/model_rollouts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id }),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('replay-note').textContent = result.error || 'Could not delete rollout.';
+        return;
+      }
+      if (selectedRollout?.id === id || selectedRollout?.name === id) {
+        clearSelectedRollout();
+      }
+      document.getElementById('replay-note').textContent = result.message || 'Deleted saved policy run.';
+      await refreshHistory();
+      await refreshEvaluationCameras();
+    }
+
+    async function deleteEvaluation(id) {
+      if (!window.confirm(`Delete evaluation ${id} and all of its rollouts?`)) return;
+      stopReplayTimer();
+      const response = await fetch('/api/evaluations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id }),
+      });
+      const result = await response.json().catch(async () => ({ ok: false, error: await response.text() }));
+      if (!response.ok || !result.ok) {
+        document.getElementById('replay-note').textContent = result.error || 'Could not delete evaluation.';
+        return;
+      }
+      if (selectedEvaluationId === id || selectedRollout?.evaluation_id === id || String(selectedRollout?.id || '').startsWith(`${id}/`)) {
+        selectedEvaluationId = null;
+        clearSelectedRollout();
+      }
+      cachedRollouts = result.model_rollouts || cachedRollouts;
+      cachedEvaluations = result.evaluations || cachedEvaluations;
+      document.getElementById('replay-note').textContent = result.message || 'Deleted evaluation.';
+      await refreshHistory();
+      await refreshEvaluationCameras();
+    }
+
     function payload() {
+      const remotePolicyServer = normalizedRemotePolicyServer();
       return {
         action: 'start',
         commands,
+        environment: document.getElementById('environment').value,
         policy_path: document.getElementById('policy-path').value,
-        remote_policy_server: document.getElementById('remote-policy-server').value,
+        remote_policy_server: remotePolicyServer,
         policy_type: document.getElementById('policy-type').value,
         actions_per_chunk: Number(document.getElementById('actions-per-chunk').value || 20),
         policy_image_size: Number(document.getElementById('policy-image-size').value || 224),
@@ -5270,6 +7698,23 @@ EVALUATOR_HTML = r"""<!doctype html>
         gripper_deadband: Number(document.getElementById('gripper-deadband').value || 0),
         gripper_max_step: Number(document.getElementById('gripper-max-step').value || 0),
       };
+    }
+
+    function normalizedRemotePolicyServer() {
+      const input = document.getElementById('remote-policy-server');
+      let value = input.value.trim();
+      if (/^https?:\/\//i.test(value)) {
+        try {
+          value = new URL(value).host;
+        } catch {
+          value = '';
+        }
+      }
+      if (!value || value === window.location.host || value.endsWith(':8766')) {
+        value = defaultRemotePolicyServer || 'desktop:8080';
+      }
+      input.value = value;
+      return value;
     }
 
     function populatePolicyPaths(defaults) {
@@ -5343,12 +7788,134 @@ EVALUATOR_HTML = r"""<!doctype html>
       }
     }
 
+    function formatTime(seconds) {
+      if (!seconds) return '-';
+      return new Date(Number(seconds) * 1000).toLocaleString();
+    }
+
+    function environmentLabel(value) {
+      return value === 'mujoco' ? 'MuJoCo' : 'Real Life';
+    }
+
+    function selectEvaluation(id) {
+      if (selectedEvaluationId === id) {
+        selectedEvaluationId = null;
+        clearSelectedRollout();
+        renderEvaluationHistory(cachedEvaluations);
+        renderRolloutHistory(rolloutsForSelectedEvaluation());
+        document.getElementById('history-status').textContent =
+          `0 rollouts · ${cachedEvaluations.length} evals`;
+        refreshEvaluationCameras().catch(() => null);
+        return;
+      }
+      selectedEvaluationId = id;
+      clearSelectedRollout();
+      renderEvaluationHistory(cachedEvaluations);
+      renderRolloutHistory(rolloutsForSelectedEvaluation());
+      document.getElementById('history-status').textContent =
+        `${rolloutsForSelectedEvaluation().length} rollouts · ${cachedEvaluations.length} evals`;
+    }
+
+    function rolloutsForSelectedEvaluation() {
+      if (!selectedEvaluationId) return [];
+      return cachedRollouts.filter(item => item.evaluation_id === selectedEvaluationId);
+    }
+
+    function renderRolloutHistory(items) {
+      const list = document.getElementById('rollout-history');
+      list.innerHTML = '';
+      document.getElementById('rollout-count').textContent = String(items.length);
+      if (!selectedEvaluationId) {
+        list.innerHTML = '<li><span>Pick an evaluation to see its rollouts.</span></li>';
+        return;
+      }
+      if (items.length === 0) {
+        list.innerHTML = '<li><span>This evaluation has no saved rollouts.</span></li>';
+        return;
+      }
+      for (const item of items) {
+        const li = document.createElement('li');
+        li.classList.toggle('selected', selectedRollout?.id === item.id || selectedRollout?.name === item.id);
+        const state = item.status || item.move_name || 'saved';
+        li.innerHTML = `
+          <div class="history-row">
+            <button class="history-main" type="button" data-rollout-id="${escapeHtml(item.id)}">
+              <strong>${escapeHtml(item.name || item.id)}</strong>
+              <span>${escapeHtml(item.move_name || '-')} · ${escapeHtml(item.samples ?? 0)} frames · ${escapeHtml(state)}</span>
+              <span>${escapeHtml(item.task || item.id)}</span>
+            </button>
+            <button class="delete-one" type="button" data-delete-rollout-id="${escapeHtml(item.id)}">Delete</button>
+          </div>
+        `;
+        li.querySelector('[data-rollout-id]').addEventListener('click', () => loadRollout(item.id));
+        li.querySelector('[data-delete-rollout-id]').addEventListener('click', event => {
+          event.stopPropagation();
+          deleteRollout(item.id);
+        });
+        list.appendChild(li);
+      }
+    }
+
+    function renderEvaluationHistory(items) {
+      const list = document.getElementById('evaluation-history');
+      list.innerHTML = '';
+      document.getElementById('evaluation-count').textContent = String(items.length);
+      if (items.length === 0) {
+        list.innerHTML = '<li><span>No saved evaluations yet.</span></li>';
+        return;
+      }
+      for (const item of items) {
+        const li = document.createElement('li');
+        li.classList.toggle('selected', selectedEvaluationId === item.id);
+        li.innerHTML = `
+          <div class="history-row">
+            <button class="history-main" type="button" data-evaluation-id="${escapeHtml(item.id)}">
+              <strong>${escapeHtml(item.name || item.id)}</strong>
+              <span>${environmentLabel(item.environment)} · ${escapeHtml(item.status)} · ${Number(item.successes || 0)}/${Number(item.total || 0)} succeeded · ${formatTime(item.started_at)}</span>
+              <span>${escapeHtml(item.message || '')}</span>
+            </button>
+            <button class="delete-one" type="button" data-delete-evaluation-id="${escapeHtml(item.id)}">Delete</button>
+          </div>
+        `;
+        li.querySelector('[data-evaluation-id]').addEventListener('click', () => selectEvaluation(item.id));
+        li.querySelector('[data-delete-evaluation-id]').addEventListener('click', event => {
+          event.stopPropagation();
+          deleteEvaluation(item.id);
+        });
+        list.appendChild(li);
+      }
+    }
+
+    async function refreshHistory() {
+      const [rolloutsResponse, evaluationsResponse] = await Promise.all([
+        fetch('/api/model_rollouts', { cache: 'no-store' }),
+        fetch('/api/evaluations', { cache: 'no-store' }),
+      ]);
+      const rollouts = await rolloutsResponse.json().catch(() => ({ model_rollouts: [] }));
+      const evaluations = await evaluationsResponse.json().catch(() => ({ evaluations: [] }));
+      cachedRollouts = rollouts.model_rollouts || [];
+      cachedEvaluations = evaluations.evaluations || [];
+      if (cachedEvaluations.length > 0 && !cachedEvaluations.some(item => item.id === selectedEvaluationId)) {
+        selectedEvaluationId = cachedEvaluations[0].id;
+      }
+      if (cachedEvaluations.length === 0) {
+        selectedEvaluationId = null;
+      }
+      renderEvaluationHistory(cachedEvaluations);
+      renderRolloutHistory(rolloutsForSelectedEvaluation());
+      document.getElementById('history-status').textContent =
+        `${rolloutsForSelectedEvaluation().length} rollouts · ${cachedEvaluations.length} evals`;
+      if (selectedRollout) updateReplayFrame();
+    }
+
     function update(data) {
       const evaluator = data.active || data.last || null;
       const defaults = data.defaults || {};
       if (!defaultsLoaded) {
         commands = defaults.commands || [];
         populatePolicyPaths(defaults);
+        document.getElementById('environment').value = defaults.environment || 'real';
+        defaultRemotePolicyServer = defaults.remote_policy_server || 'desktop:8080';
         document.getElementById('remote-policy-server').value = defaults.remote_policy_server || '';
         document.getElementById('policy-type').value = defaults.policy_type || 'act';
         document.getElementById('actions-per-chunk').value = defaults.actions_per_chunk || 20;
@@ -5361,7 +7928,11 @@ EVALUATOR_HTML = r"""<!doctype html>
       }
       const active = Boolean(data.active);
       document.getElementById('status').textContent = evaluator?.status || 'idle';
-      document.getElementById('message').textContent = evaluator?.message || data.message || '';
+      const environment = evaluator?.environment || document.getElementById('environment').value || 'real';
+      const environmentHint = environment === 'mujoco'
+        ? 'MuJoCo simulation is selectable, but running policy evaluations there is not wired into this dashboard yet.'
+        : '';
+      document.getElementById('message').textContent = evaluator?.message || data.message || environmentHint;
       document.getElementById('directory').textContent = evaluator?.directory || '-';
       document.getElementById('successes').textContent = evaluator?.successes ?? 0;
       document.getElementById('failures').textContent = evaluator?.failures ?? 0;
@@ -5379,6 +7950,11 @@ EVALUATOR_HTML = r"""<!doctype html>
     }
 
     async function start() {
+      selectedEvaluationId = null;
+      clearSelectedRollout();
+      renderEvaluationHistory(cachedEvaluations);
+      renderRolloutHistory(rolloutsForSelectedEvaluation());
+      await refreshEvaluationCameras().catch(() => null);
       const response = await fetch('/api/evaluator', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -5403,8 +7979,26 @@ EVALUATOR_HTML = r"""<!doctype html>
 
     document.getElementById('start').addEventListener('click', start);
     document.getElementById('stop').addEventListener('click', stop);
+    document.getElementById('environment').addEventListener('change', () => {
+      if (document.getElementById('environment').value === 'mujoco') {
+        document.getElementById('message').textContent =
+          'MuJoCo simulation is selectable, but running policy evaluations there is not wired into this dashboard yet.';
+      } else {
+        document.getElementById('message').textContent = '';
+      }
+    });
+    document.getElementById('replay-play').addEventListener('click', toggleReplay);
+    document.getElementById('replay-slider').addEventListener('input', event => {
+      stopReplayTimer();
+      replayFrame = Number(event.target.value || 0);
+      updateReplayFrame();
+    });
     refresh();
+    refreshEvaluationCameras().catch(() => null);
+    refreshHistory().catch(() => null);
     setInterval(refresh, 1000);
+    setInterval(() => refreshEvaluationCameras().catch(() => null), 500);
+    setInterval(() => refreshHistory().catch(() => null), 3000);
   </script>
 </body>
 </html>
@@ -5820,6 +8414,24 @@ ANNOTATION_HTML = r"""<!doctype html>
       border-color: #c84b40;
       background: #fff0ee;
     }
+    .recording-summary {
+      display: grid;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfcfd;
+    }
+    .recording-summary-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
     @media (max-width: 980px) {
       main {
         height: auto;
@@ -5951,6 +8563,13 @@ ANNOTATION_HTML = r"""<!doctype html>
         </div>
         <div id="message" class="note"></div>
         <ul id="saved" class="saved"></ul>
+      </div>
+      <div class="recording-summary">
+        <div class="recording-summary-title">
+          <span>Training Recordings</span>
+          <span id="vision-recording-count">0</span>
+        </div>
+        <ul id="vision-recordings" class="saved"></ul>
       </div>
     </section>
   </main>
@@ -6516,6 +9135,33 @@ ANNOTATION_HTML = r"""<!doctype html>
       }
     }
 
+    async function refreshVisionRecordings() {
+      const response = await fetch('/api/recordings', { cache: 'no-store' });
+      const result = await response.json().catch(() => ({ recordings: [] }));
+      const recordings = result.recordings || [];
+      const list = document.getElementById('vision-recordings');
+      document.getElementById('vision-recording-count').textContent = String(recordings.length);
+      list.innerHTML = '';
+      if (recordings.length === 0) {
+        const li = document.createElement('li');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'No training recordings yet.';
+        li.appendChild(button);
+        list.appendChild(li);
+        return;
+      }
+      for (const item of recordings) {
+        const li = document.createElement('li');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = `${item.name}: ${item.samples} samples, ${item.move_name || 'unlabeled'} · ${item.status}`;
+        button.title = item.id || item.name;
+        li.appendChild(button);
+        list.appendChild(li);
+      }
+    }
+
     async function openAnnotation(file, { forceReload = false } = {}) {
       if (selectedAnnotation?.file === file && !forceReload) return;
       const response = await fetch(`/api/annotation?file=${encodeURIComponent(file)}`, { cache: 'no-store' });
@@ -6627,7 +9273,9 @@ ANNOTATION_HTML = r"""<!doctype html>
     buildBoard();
     renderBoard();
     refreshSaved();
+    refreshVisionRecordings();
     setInterval(refreshState, cameraRefreshMs);
+    setInterval(refreshVisionRecordings, 3000);
     setInterval(() => {
       if (autodetectEnabled) detectCurrent({ silent: true });
     }, detectionRefreshMs);
@@ -6650,14 +9298,46 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            embedded = query.get("embed", ["0"])[0] == "1"
             if parsed.path == "/":
-                self._send_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")
+                self._send_bytes(DASHBOARD_SHELL_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/training":
+                if embedded:
+                    self._send_bytes(
+                        embedded_dashboard_html(HTML, "training").encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._redirect("/")
                 return
             if parsed.path == "/annotate":
-                self._send_bytes(ANNOTATION_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                if embedded:
+                    self._send_bytes(
+                        embedded_dashboard_html(ANNOTATION_HTML, "vision").encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._redirect("/?tab=vision")
+                return
+            if parsed.path == "/control":
+                if embedded:
+                    self._send_bytes(
+                        embedded_dashboard_html(CONTROL_HTML, "control").encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._redirect("/?tab=control")
                 return
             if parsed.path == "/evaluate":
-                self._send_bytes(EVALUATOR_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                if embedded:
+                    self._send_bytes(
+                        embedded_dashboard_html(EVALUATOR_HTML, "evaluation").encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    self._redirect("/?tab=evaluation")
                 return
             if parsed.path == "/api/state":
                 self._send_bytes(json_bytes(app.state_json()), "application/json")
@@ -6668,11 +9348,20 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
             if parsed.path == "/api/recordings":
                 self._send_bytes(json_bytes(app.list_recordings()), "application/json")
                 return
+            if parsed.path == "/api/control_recordings":
+                self._send_bytes(json_bytes(app.list_control_recordings()), "application/json")
+                return
             if parsed.path == "/api/model_rollouts":
                 self._send_bytes(json_bytes(app.list_model_rollouts()), "application/json")
                 return
             if parsed.path == "/api/evaluator":
                 self._send_bytes(json_bytes(app.evaluator_json()), "application/json")
+                return
+            if parsed.path == "/api/control":
+                self._send_bytes(json_bytes(app.control_json()), "application/json")
+                return
+            if parsed.path == "/api/evaluations":
+                self._send_bytes(json_bytes(app.list_evaluations()), "application/json")
                 return
             if parsed.path == "/api/synthetic_recordings":
                 self._send_bytes(json_bytes(app.list_synthetic_recordings()), "application/json")
@@ -6855,6 +9544,8 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                 "/api/model_run",
                 "/api/model_rollouts",
                 "/api/evaluator",
+                "/api/control",
+                "/api/evaluations",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -6932,6 +9623,14 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                         result = app.stop_evaluator()
                     else:
                         raise ValueError("Evaluator action must be 'start' or 'stop'.")
+                elif parsed.path == "/api/control":
+                    result = app.handle_control_action(payload)
+                elif parsed.path == "/api/evaluations":
+                    action = payload.get("action")
+                    if action == "delete":
+                        result = app.delete_evaluation(str(payload.get("id", "")))
+                    else:
+                        raise ValueError("Evaluations action must be 'delete'.")
                 else:
                     result = app.save_annotation(payload)
             except Exception as exc:
@@ -6944,6 +9643,12 @@ def make_handler(app: DashboardApp) -> type[BaseHTTPRequestHandler]:
                 return
 
             self._send_bytes(json_bytes(result), "application/json")
+
+        def _redirect(self, location: str) -> None:
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
 
         def _send_bytes(self, body: bytes, content_type: str) -> None:
             try:
@@ -7001,6 +9706,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("examples/go_board/cv_snapshots"),
         help="Directory for annotated CV test snapshots.",
+    )
+    parser.add_argument(
+        "--control-recording-dir",
+        type=Path,
+        default=None,
+        help="Directory for autonomous control recording folders. Defaults to examples/go_board/control_recordings.",
     )
     parser.add_argument(
         "--synthetic-recording-dir",
@@ -7072,8 +9783,10 @@ def main() -> None:
         telemetry=telemetry,
         board=config.board,
         model=config.model,
+        control=config.control,
         annotation_dir=args.annotation_dir,
         config_path=args.config,
+        control_recording_dir=args.control_recording_dir,
         synthetic_recording_dir=args.synthetic_recording_dir,
     )
     app.start()

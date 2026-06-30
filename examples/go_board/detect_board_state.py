@@ -17,6 +17,7 @@ import numpy as np
 
 
 GO_COLUMNS = "ABCDEFGHJKLMNOPQRST"
+CORNER_REFERENCE_SIZES = ((1920, 1080), (1280, 720), (640, 480))
 
 
 @dataclass
@@ -111,6 +112,46 @@ def auto_detect_board_corners(image: np.ndarray) -> np.ndarray:
 
     best = max(candidates, key=cv2.contourArea)
     return order_corners(best)
+
+
+def normalize_corners_for_image(corners: np.ndarray, image_shape: tuple[int, ...]) -> np.ndarray:
+    """Return corners in the current image coordinate system.
+
+    Dashboard camera modes can change resolution while retaining corner
+    calibrations from an earlier high-resolution frame. If all configured
+    corners are already plausible for the image, keep them unchanged. Otherwise
+    try common camera reference sizes and rescale to the current frame.
+    """
+    corners = np.asarray(corners, dtype=np.float32).copy()
+    height, width = image_shape[:2]
+    if height <= 0 or width <= 0:
+        return corners
+
+    margin = max(width, height) * 0.05
+    min_xy = corners.min(axis=0)
+    max_xy = corners.max(axis=0)
+    if min_xy[0] >= -margin and min_xy[1] >= -margin and max_xy[0] <= width + margin and max_xy[1] <= height + margin:
+        return corners
+
+    best: np.ndarray | None = None
+    best_overflow = float("inf")
+    for ref_width, ref_height in CORNER_REFERENCE_SIZES:
+        if ref_width <= width and ref_height <= height:
+            continue
+        if max_xy[0] > ref_width * 1.05 or max_xy[1] > ref_height * 1.05:
+            continue
+        scaled = corners.copy()
+        scaled[:, 0] *= width / ref_width
+        scaled[:, 1] *= height / ref_height
+        scaled_min = scaled.min(axis=0)
+        scaled_max = scaled.max(axis=0)
+        overflow = max(0.0, -float(scaled_min[0]), -float(scaled_min[1]))
+        overflow += max(0.0, float(scaled_max[0]) - width, float(scaled_max[1]) - height)
+        if overflow < best_overflow:
+            best = scaled
+            best_overflow = overflow
+
+    return best if best is not None else corners
 
 
 def warp_board(
@@ -245,7 +286,7 @@ def curved_grid_points_from_corners(
     curve_k: float,
 ) -> list[list[tuple[float, float]]]:
     """Return camera-space grid points with curved interior and fixed corners."""
-    corners = corners.astype(np.float32)
+    corners = normalize_corners_for_image(corners, image_shape)
     corner_offsets = np.array([radial_curve_point(point, image_shape, curve_k) - point for point in corners], dtype=np.float32)
     points: list[list[tuple[float, float]]] = []
     for row in range(size):
@@ -612,6 +653,7 @@ def detect_stones(
     overlay_fisheye_k: float,
     skip_i: bool,
 ) -> tuple[list[Stone], np.ndarray, np.ndarray]:
+    corners = normalize_corners_for_image(corners, image.shape)
     spacing = (board_pixels - 1) / (size - 1)
     grid_margin = int(round(spacing * max(stone_max_radius_ratio, 0.55)))
     warped, to_board, to_image = warp_board_with_margin(image, corners, board_pixels, grid_margin)
@@ -682,7 +724,11 @@ def board_state_from_image(
     skip_i: bool = True,
 ) -> BoardState:
     """Detect the complete Go board state from an image array."""
-    detected_corners = corners if corners is not None else auto_detect_board_corners(image)
+    detected_corners = (
+        normalize_corners_for_image(corners, image.shape)
+        if corners is not None
+        else auto_detect_board_corners(image)
+    )
     stones, _warped, _to_image = detect_stones(
         image=image,
         corners=detected_corners,

@@ -209,6 +209,10 @@ def _add_done_env_feature(dataset_features: dict[str, Any]) -> None:
     dataset_features[OBS_ENV_STATE] = _done_env_feature()
 
 
+def _policy_uses_done_env_state(policy_config: PreTrainedConfig) -> bool:
+    return OBS_ENV_STATE in (policy_config.input_features or {})
+
+
 def _board_detection_kwargs_from_dashboard(config: Any) -> dict[str, Any]:
     return {
         "size": int(config.board.size),
@@ -718,7 +722,9 @@ def run_remote_policy_server_rollout(args: argparse.Namespace, config: Any, targ
         action_keys = [key for key in robot.action_features if key.endswith(".pos")]
         observation_features = _remote_observation_features(robot.observation_features, image_size)
         lerobot_features = hw_to_dataset_features(observation_features, OBS_STR, use_video=False)
-        _add_done_env_feature(lerobot_features)
+        policy_config = PreTrainedConfig.from_pretrained(args.policy_path)
+        if _policy_uses_done_env_state(policy_config):
+            _add_done_env_feature(lerobot_features)
         policy_setup = RemotePolicyConfig(
             policy_type=args.policy_type,
             pretrained_name_or_path=args.policy_path,
@@ -981,7 +987,8 @@ def main() -> None:
 
     signal_handler = ProcessSignalHandler(use_threads=True)
     context = build_rollout_context(cfg, signal_handler.shutdown_event, robot_observation_processor=overlay_processor)
-    _add_done_env_feature(context.data.dataset_features)
+    if _policy_uses_done_env_state(policy_config):
+        _add_done_env_feature(context.data.dataset_features)
     strategy = TimedBaseStrategy(
         cfg.strategy,
         warn_threshold_s=args.timing_warn_threshold,
